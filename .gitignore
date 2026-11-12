@@ -11,3 +11,4 @@ target/
 # local test databases
 *.db
 test-ledger/
+claude.md
