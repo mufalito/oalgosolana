@@ -12,8 +12,6 @@ Self-hosted Solana payment gateway with three payment modes:
 [vault-program/README.md](vault-program/README.md) before putting real money
 behind it.
 
-Full requirements spec: [docs/SPEC.md](docs/SPEC.md).
-
 ## Repository layout
 
 ```
@@ -35,7 +33,6 @@ api/openapi.yaml   API spec (source of truth)
 migrations/        SQL migrations (embedded in the binary)
 vault-program/     Anchor (otter-sec fork) deposit-vault program
 examples/          curl + JS integration snippets
-docs/SPEC.md       original requirements specification
 ```
  Create payments, hand
 customers a native Solana Pay URL + QR code, watch the chain, and receive
