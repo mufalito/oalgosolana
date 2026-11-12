@@ -1,0 +1,13 @@
+# secrets & local config
+.env
+*.json.keypair
+# go
+/bin/
+/solanapay
+# rust / solana build artifacts
+vault-program/target/
+*.so
+target/
+# local test databases
+*.db
+test-ledger/

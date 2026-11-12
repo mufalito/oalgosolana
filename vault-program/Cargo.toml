@@ -1,0 +1,16 @@
+[package]
+name = "vault-anchor"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+anchor-lang = { git = "https://github.com/otter-sec/anchor", branch = "master" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+overflow-checks = true
+strip = true

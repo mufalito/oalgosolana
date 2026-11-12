@@ -1,0 +1,30 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: solanapay
+      POSTGRES_PASSWORD: solanapay
+      POSTGRES_DB: solanapay
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U solanapay"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://solanapay:solanapay@postgres:5432/solanapay?sslmode=disable
+    ports:
+      - "8080:8080"
+
+volumes:
+  pgdata:
