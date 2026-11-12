@@ -3,7 +3,6 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"github.com/gagliardetto/solana-go"
 	"log/slog"
@@ -28,6 +27,25 @@ import (
 	"github.com/mufalito/oalgosolana/internal/watcher"
 	"github.com/mufalito/oalgosolana/internal/webhook"
 )
+
+// vaultAdapter bridges vault.Sweeper to the watcher's DepositSweeper.
+type vaultAdapter struct{ S *vault.Sweeper }
+
+func (a *vaultAdapter) SweepVault(ctx context.Context, invoiceID string) (string, error) {
+	return a.S.SweepVault(ctx, invoiceID)
+}
+
+func (a *vaultAdapter) CheckSweep(ctx context.Context, sig string) (watcher.SweepState, error) {
+	st, err := a.S.SweepState(ctx, sig)
+	switch st {
+	case "landed":
+		return watcher.SweepLanded, err
+	case "failed":
+		return watcher.SweepFailed, err
+	default:
+		return watcher.SweepPending, err
+	}
+}
 
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -57,6 +75,15 @@ func main() {
 
 	paySvc := &payment.Service{Store: st, Cfg: cfg, Log: log}
 	paySvc.OnCreated = func(currency string) { metrics.PaymentsCreated.WithLabelValues(currency).Inc() }
+	if cfg.DepositAddressMode {
+		programID, err := solana.PublicKeyFromBase58(cfg.DepositProgramID)
+		if err != nil {
+			log.Error("invalid DEPOSIT_PROGRAM_ID")
+			os.Exit(1)
+		}
+		paySvc.DepositProgramID = programID
+		paySvc.DepositRentMinimum = detector.RentExemptMinimum
+	}
 
 	replayer := func(ctx context.Context, paymentID string) error {
 		found, err := st.ReplayDelivery(ctx, paymentID)
@@ -86,33 +113,29 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	var masterKey []byte
 	var depositSweeper watcher.DepositSweeper
 	if cfg.DepositAddressMode {
-		masterKey, _ = base64.StdEncoding.DecodeString(cfg.DepositMasterKeyRaw)
 		hw, err := solana.PrivateKeyFromSolanaKeygenFile(cfg.GatewayHotWallet)
 		if err != nil {
 			log.Error("load GATEWAY_HOT_WALLET", "err", err.Error())
 			os.Exit(1)
 		}
-		programID, err := solana.PublicKeyFromBase58(cfg.DepositProgramID)
-		if err != nil {
-			log.Error("invalid DEPOSIT_PROGRAM_ID")
-			os.Exit(1)
+		programID, _ := solana.PublicKeyFromBase58(cfg.DepositProgramID)
+		vs := &vault.Sweeper{
+			RPC: detector, ProgramID: programID, Merchant: cfg.MerchantWallet, HotWallet: hw,
 		}
-		vs := &vault.Sweeper{RPC: detector, ProgramID: programID, HotWallet: hw, ColdWallet: cfg.MerchantWallet}
-		depositSweeper = &vault.DepositSweeperAdapter{S: vs}
-		paySvc.VaultCreator = vs
+		depositSweeper = &vaultAdapter{S: vs}
 	}
 
 	w := &watcher.Watcher{
 		DB: st, Detector: detector, Log: log,
-		Sweeper: depositSweeper, MasterKey: masterKey,
+		Sweeper: depositSweeper,
 		Cfg: watcher.WatcherConfig{
 			ConfirmationPolicy: cfg.ConfirmationPolicy,
 			USDCMint:           cfg.USDCMint(),
 			PollInterval:       cfg.PollInterval,
 			Workers:            cfg.WorkerCount,
+			DepositMode:        cfg.DepositAddressMode,
 		},
 		OnTransition: func(from, to, reason string) {
 			switch to {

@@ -28,19 +28,27 @@ func (r Reason) Failed() bool { return r != Valid }
 // Deltas must be computed for the payment's merchant wallet by the Detector.
 // It never inspects SPL instruction data; amounts come from balance deltas.
 func Validate(tx *TxInfo, p *store.Payment, usdcMint string) Reason {
-	if !containsKey(tx.AccountKeys, p.MerchantWallet) {
-		return WrongRecipient
-	}
-	if !containsKey(tx.AccountKeys, p.Reference) {
-		return MissingReference
-	}
 	if p.Currency == string(solanapay.SOL) {
+		// SOL: the merchant wallet itself is a tx account; the recipient
+		// delta must match exactly.
+		if !containsKey(tx.AccountKeys, p.MerchantWallet) {
+			return WrongRecipient
+		}
+		if !containsKey(tx.AccountKeys, p.Reference) {
+			return MissingReference
+		}
 		if tx.RecipientDeltaLamports != p.AmountBase {
 			return WrongAmount
 		}
 		return Valid
 	}
-	// USDC: token delta on the expected mint must match exactly; value on any
+	// USDC: the merchant wallet is the OWNER of the destination token account
+	// and is usually NOT among accountKeys (which list token accounts), so
+	// recipient attribution comes from owner-filtered TokenDeltas instead.
+	if !containsKey(tx.AccountKeys, p.Reference) {
+		return MissingReference
+	}
+	// Token delta on the expected mint must match exactly; value on any
 	// other mint means this is not the expected payment.
 	delta, ok := tx.TokenDeltas[usdcMint]
 	if !ok || delta == 0 {

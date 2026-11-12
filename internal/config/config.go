@@ -4,8 +4,6 @@
 package config
 
 import (
-	"encoding/base64"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -35,9 +33,6 @@ type Config struct {
 	RateLimitRPS          float64       `env:"RATE_LIMIT_RPS" envDefault:"10"`
 	RateLimitBurst        int           `env:"RATE_LIMIT_BURST" envDefault:"20"`
 	DepositAddressMode    bool          `env:"DEPOSIT_ADDRESS_MODE" envDefault:"false"`
-	// DepositMasterKey: base64 32-byte key encrypting deposit keypair secrets.
-	// Required when DepositAddressMode is enabled; never persisted.
-	DepositMasterKeyRaw string `env:"DEPOSIT_MASTER_KEY"`
 	// Deposit mode uses on-chain vault program PDAs: funds can only ever
 	// leave to the cold wallet (see vault-program/).
 	DepositProgramID string `env:"DEPOSIT_PROGRAM_ID"`
@@ -45,17 +40,6 @@ type Config struct {
 	// (vault backend only). It can create vaults and trigger sweeps but can
 	// never redirect funds.
 	GatewayHotWallet string `env:"GATEWAY_HOT_WALLET"`
-}
-
-func validateDepositMasterKey(s string) error {
-	raw, err := base64.StdEncoding.DecodeString(s)
-	if err != nil {
-		return err
-	}
-	if len(raw) != 32 {
-		return errors.New("must be a base64-encoded 32-byte key")
-	}
-	return nil
 }
 
 // USDCMint returns the configured USDC mint for the cluster, or "" when not
@@ -120,9 +104,6 @@ func Load() (*Config, error) {
 		errs = append(errs, "WORKER_COUNT: must be >= 1")
 	}
 	if cfg.DepositAddressMode {
-		if err := validateDepositMasterKey(cfg.DepositMasterKeyRaw); err != nil {
-			errs = append(errs, "DEPOSIT_MASTER_KEY: "+err.Error())
-		}
 		if _, err := solana.PublicKeyFromBase58(cfg.DepositProgramID); err != nil {
 			errs = append(errs, "DEPOSIT_PROGRAM_ID: invalid base58 pubkey (required in deposit mode)")
 		}

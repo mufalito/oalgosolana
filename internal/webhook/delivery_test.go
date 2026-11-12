@@ -49,7 +49,7 @@ func testDB(t *testing.T) *store.Store {
 		t.Skipf("database not reachable: %v", err)
 	}
 	t.Cleanup(st.Close)
-	if _, err := st.Pool.Exec(ctx, `TRUNCATE webhook_deliveries, payment_txs, deposit_keys, payments`); err != nil {
+	if _, err := st.Pool.Exec(ctx, `TRUNCATE webhook_deliveries, payment_txs, payments`); err != nil {
 		t.Fatal(err)
 	}
 	return st

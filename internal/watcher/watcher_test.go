@@ -79,7 +79,7 @@ func testDB(t *testing.T) *store.Store {
 	}
 	t.Cleanup(st.Close)
 	// clean slate
-	if _, err := st.Pool.Exec(ctx, `TRUNCATE webhook_deliveries, payment_txs, deposit_keys, payments`); err != nil {
+	if _, err := st.Pool.Exec(ctx, `TRUNCATE webhook_deliveries, payment_txs, payments`); err != nil {
 		t.Fatal(err)
 	}
 	return st
@@ -87,7 +87,7 @@ func testDB(t *testing.T) *store.Store {
 
 func mkTx(merchant, ref string, lamports uint64) *chain.TxInfo {
 	return &chain.TxInfo{
-		Signature:              "sig_" + ref[:8],
+		Signature:              "sig_" + ref[:8] + "_" + u64str(lamports),
 		RecipientDeltaLamports: lamports,
 		TokenDeltas:            map[string]uint64{},
 		AccountKeys:            []string{"SomeSender11111111111111111111111111111111111", merchant, ref},
@@ -183,7 +183,7 @@ func TestPendingToConfirmedToFinalized(t *testing.T) {
 	}
 }
 
-func TestWrongAmountFails(t *testing.T) {
+func TestWrongAmountCandidateSkipped(t *testing.T) {
 	db := testDB(t)
 	p := insertPayment(t, db, "pending", "")
 	tx := mkTx(testMerchant, p.Reference, 1400000000) // underpaid
@@ -195,9 +195,30 @@ func TestWrongAmountFails(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// A stray underpaid transfer must NOT doom the invoice: the candidate is
+	// claimed and skipped, and the invoice stays pending for the real payment.
 	row, _ := db.GetPayment(ctx, uuidMustParse(p.ID))
-	if row.Status != "failed" || row.FailureReason != "WRONG_AMOUNT" {
-		t.Fatalf("got status=%s reason=%s", row.Status, row.FailureReason)
+	if row.Status != "pending" {
+		t.Fatalf("got status=%s, want pending (candidate skipped)", row.Status)
+	}
+	var claims int
+	db.Pool.QueryRow(ctx, `SELECT count(*) FROM payment_txs WHERE payment_id=$1`, p.ID).Scan(&claims)
+	if claims != 1 {
+		t.Fatalf("claimed candidates = %d, want 1", claims)
+	}
+	// the correct payment arriving later still confirms
+	good := mkTx(testMerchant, p.Reference, 1500000000)
+	det.txs[good.Signature] = good
+	det.sigs = append(det.sigs, good.Signature)
+	if err := w.pollOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.pollOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	row, _ = db.GetPayment(ctx, uuidMustParse(p.ID))
+	if row.Status != "confirmed" {
+		t.Fatalf("after correct payment: %s", row.Status)
 	}
 }
 
@@ -247,6 +268,20 @@ func TestNoWebhookWhenUnconfigured(t *testing.T) {
 	if n != 0 {
 		t.Fatalf("deliveries = %d, want 0", n)
 	}
+}
+
+func u64str(n uint64) string {
+	if n == 0 {
+		return "0"
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(b[i:])
 }
 
 func uuidMustParse(s string) uuid.UUID {

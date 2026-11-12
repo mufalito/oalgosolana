@@ -123,7 +123,9 @@ pending → processing → confirmed → finalized
   never changes state or re-fires webhooks. Webhook queue has unique
   `(payment_id, event_type)` — at-least-once delivery, consumers must
   tolerate duplicates.
-- Claims use `SELECT ... FOR UPDATE SKIP LOCKED`; run multiple replicas safely.
+- Webhook delivery claims use `FOR UPDATE SKIP LOCKED` (replica-safe). The
+  payment poll is idempotent by candidate-claim but NOT row-locked across
+  its RPC calls: run one watcher per database.
 - Confirmation policy (`CONFIRMATION_POLICY=confirmed|finalized`):
   `confirmed` fires the webhook at ~2 s and escalates to a `payment.finalized`
   event at finality; `finalized` fires once, only at finality.
@@ -185,26 +187,31 @@ unreachable). End-to-end tests against `solana-test-validator` run when
 ## Optional deposit-address mode (vault program)
 
 `DEPOSIT_ADDRESS_MODE=true` + `DEPOSIT_PROGRAM_ID` + `GATEWAY_HOT_WALLET`:
-every invoice's deposit address is a **PDA of the deployed vault program**
-(`vault-program/`, Anchor). The program records your cold wallet at creation
-and will only ever move funds there — enforced by a declarative account
-constraint, verified live on devnet (a sweep naming any other destination is
-rejected on-chain with `WrongColdWallet`). The gateway's hot wallet pays
-vault rent + fees and triggers sweeps — **it cannot redirect or steal
-funds**. A full server compromise can delay sweeps (DoS) but every lamport
-still reaches your cold wallet. Rent per vault (~0.0001 SOL) stays locked
-while the vault lives. Guard the program's upgrade authority — revoke it
+every invoice's deposit address is the vault PDA derived from
+`["vault", merchant, invoice_id]` — **nothing is created on-chain at invoice
+time** (zero cost for unpaid invoices; no create transaction that could
+fail or be front-run). The customer's own transfer creates the vault and
+pays its rent; the `sweep` instruction moves the **entire balance** to the
+merchant embedded in the seeds, closing the account — a sweep naming any
+other destination derives a different address and is rejected on-chain
+(`ConstraintSeeds`, verified live on devnet). The gateway's hot wallet pays
+sweep fees only; it cannot redirect funds. A full server compromise can
+hand customers different addresses for NEW invoices (the merchant can
+independently recompute every address to detect this) and delay sweeps, but
+cannot redirect or steal money already paid in. Minimum invoice in this mode
+is the rent-exempt minimum for an empty account, read live from RPC.
+Guard the program's upgrade authority — revoke it
 (`solana program set-upgrade-authority --final`) or multisig it.
 
 Customers pay a plain address + amount from any wallet or exchange — no
-Solana Pay support, no reference, no memo. On confirmation the gateway
-sweeps to your merchant wallet automatically (SOL only; USDC remains
-reference-mode only). Vault seeds are AES-256-GCM-encrypted in
-`deposit_keys` with `DEPOSIT_MASTER_KEY` (env, never persisted). Late funds
-on expired invoices are detected and swept too. In this mode the
-non-custodial compromise-safety claim applies to reference mode only —
-deposit mode is custody-constrained (destination fixed on-chain), not
-key-free.
+Solana Pay support, no reference, no memo. Detection is balance-based: when
+the vault holds the invoiced amount, the gateway sweeps and treats the
+confirmed sweep as the receipt; failed or dropped sweeps are re-sent. Funds
+arriving late (expired invoice) are detected by balance and swept too —
+money in a vault always reaches the merchant. SOL only; USDC remains
+reference-mode only. In this mode the non-custodial compromise-safety claim
+applies to reference mode only — deposit mode is custody-constrained
+(destination fixed on-chain), not key-free.
 
 Per-invoice matching semantics in deposit mode: attribution is by unique
 address; payments are confirmed once received lamports ≥ invoice amount

@@ -18,7 +18,7 @@ import (
 	"github.com/mufalito/oalgosolana/internal/config"
 	"github.com/mufalito/oalgosolana/internal/solanapay"
 	"github.com/mufalito/oalgosolana/internal/store"
-	"github.com/mufalito/oalgosolana/internal/wallet"
+	"github.com/mufalito/oalgosolana/internal/vault"
 )
 
 // CreateRequest is the validated input of POST /api/v1/payments.
@@ -40,13 +40,11 @@ type Service struct {
 	Log   *slog.Logger
 	// OnCreated is an optional metrics hook (currency label).
 	OnCreated func(currency string)
-	// VaultCreator creates on-chain deposit vaults (vault backend only).
-	VaultCreator VaultCreator
-}
-
-// VaultCreator is implemented by vault.Sweeper.
-type VaultCreator interface {
-	CreateVault(ctx context.Context, seed solana.PublicKey) (solana.PublicKey, error)
+	// DepositProgramID + DepositRentMinimum are set in deposit mode.
+	// RentMinimum is read from RPC (rent changes with protocol upgrades);
+	// the first transfer to a fresh vault address must cover it.
+	DepositProgramID   solana.PublicKey
+	DepositRentMinimum func(ctx context.Context) uint64
 }
 
 // Created is the response payload of payment creation.
@@ -122,29 +120,27 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Created, erro
 	if err != nil {
 		return nil, apierr.Errorf(500, apierr.CodeInternal, "generate reference")
 	}
-	var depositSecret []byte
+	id := uuid.Must(uuid.NewV7())
 	var vaultAddr string
 	if s.Cfg.DepositAddressMode {
-		// Deposit address is a vault-program PDA whose funds can only leave
-		// to the cold wallet. The stored "secret" is just the 32-byte seed
-		// (no private key exists).
-		seed, err := solanapay.NewReference()
-		if err != nil {
-			return nil, apierr.Errorf(500, apierr.CodeInternal, "generate vault seed")
+		// Deposit address = vault PDA derived from [merchant, invoice id].
+		// Nothing is created on-chain at invoice time: the customer's own
+		// transfer creates the vault (and pays its rent); the sweep drains
+		// it entirely. No secrets, no keys, no create transaction.
+		if s.DepositRentMinimum != nil {
+			if min := s.DepositRentMinimum(ctx); amountBase < min {
+				return nil, apierr.Errorf(400, apierr.CodeInvalidAmount,
+					"deposit-address mode requires at least %s SOL (rent-exempt minimum read from RPC)",
+					solanapay.FormatAmount(min, solanapay.SOL))
+			}
 		}
-		addr, err := s.VaultCreator.CreateVault(ctx, seed)
+		addr, err := vault.Address(s.Cfg.MerchantWallet, id.String(), s.DepositProgramID)
 		if err != nil {
-			s.Log.ErrorContext(ctx, "vault creation failed", "err", err.Error())
-			return nil, apierr.Errorf(500, apierr.CodeInternal, "create deposit vault")
+			return nil, apierr.Errorf(500, apierr.CodeInternal, "derive vault address")
 		}
 		vaultAddr = addr.String()
 		reference = addr
-		depositSecret, err = wallet.EncryptSecret(seed.Bytes(), s.depositMasterKey())
-		if err != nil {
-			return nil, apierr.Errorf(500, apierr.CodeInternal, "encrypt vault seed")
-		}
 	}
-	id := uuid.Must(uuid.NewV7())
 	now := time.Now().UTC()
 	p := &store.Payment{
 		ID:             id.String(),
@@ -165,13 +161,6 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Created, erro
 			return nil, apierr.Errorf(409, apierr.CodeDuplicateOrder, "order_id already exists")
 		}
 		return nil, apierr.Errorf(500, apierr.CodeInternal, "persist payment")
-	}
-	if depositSecret != nil {
-		if err := s.Store.CreateDepositKey(ctx, &store.DepositKeyRow{
-			PaymentID: p.ID, PublicKey: p.Reference, EncryptedSecret: depositSecret,
-		}); err != nil {
-			return nil, apierr.Errorf(500, apierr.CodeInternal, "persist deposit key")
-		}
 	}
 	mint := ""
 	if cur == solanapay.USDC {
@@ -212,14 +201,6 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Created, erro
 		resp.DepositAddress = vaultAddr
 	}
 	return resp, nil
-}
-
-func (s *Service) depositMasterKey() []byte {
-	raw, err := base64.StdEncoding.DecodeString(s.Cfg.DepositMasterKeyRaw)
-	if err != nil || len(raw) != 32 {
-		return nil
-	}
-	return raw
 }
 
 // GetByID fetches a payment; store.ErrNotFound maps to 404.

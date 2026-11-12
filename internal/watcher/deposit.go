@@ -2,117 +2,118 @@ package watcher
 
 import (
 	"context"
-	"time"
 
-	"github.com/mufalito/oalgosolana/internal/chain"
 	"github.com/mufalito/oalgosolana/internal/store"
-	"github.com/mufalito/oalgosolana/internal/wallet"
 )
 
-// DepositSweeper moves deposit-address funds to the merchant wallet and
-// reports sweep finality (implemented by internal/sweep; faked in tests).
+// SweepState describes what happened to a sent sweep.
+type SweepState int
+
+const (
+	SweepPending SweepState = iota // in flight, not yet finalized
+	SweepLanded                    // finalized successfully
+	SweepFailed                    // failed on-chain or dropped: re-send
+)
+
+// DepositSweeper sweeps derived vaults for deposit-address payments.
 type DepositSweeper interface {
-	Sweep(ctx context.Context, secret []byte) (string, error)
-	Finalized(ctx context.Context, sig string) (bool, error)
+	SweepVault(ctx context.Context, invoiceID string) (string, error)
+	CheckSweep(ctx context.Context, sig string) (SweepState, error)
 }
 
-// processDeposit drives deposit-address-mode payments:
+// DepositBalanceReader is the balance capability the detector must provide
+// in deposit mode.
+type DepositBalanceReader interface {
+	GetBalance(ctx context.Context, address string) (uint64, error)
+}
+
+// processDeposit drives deposit-address payments using BALANCES, not
+// signature history:
 //
-//	pending/processing: poll the deposit address, sum incoming lamports,
-//	  confirm once >= amount_base (attribution is by unique address, so
-//	  overpayment and multiple transfers are tolerated).
-//	confirmed: sweep full balance to merchant, then finalize when the
-//	  sweep itself is finalized.
+//	pending/processing: when the vault balance >= amount_base, send the
+//	  sweep (the customer's own transfer created the vault and paid its
+//	  rent; a full drain returns everything, rent included).
+//	confirmed (sweep sent): finalize only when the sweep has actually
+//	  LANDED (finalized, err==nil); a failed/dropped sweep is re-sent on a
+//	  later tick until the vault is empty.
 func (w *Watcher) processDeposit(ctx context.Context, p *store.Payment) error {
-	keyRow, err := w.DB.GetDepositKey(ctx, p.ID)
-	if err != nil {
-		return err
-	}
-	if keyRow == nil {
-		return nil // not a deposit payment
+	balancer, ok := w.Detector.(DepositBalanceReader)
+	if !ok {
+		return nil
 	}
 
 	switch p.Status {
 	case "pending", "processing":
-		sigs, err := w.Detector.SignaturesForAddress(ctx, p.Reference)
+		balance, err := balancer.GetBalance(ctx, p.Reference)
 		if err != nil {
 			return err
 		}
-		total := uint64(0)
-		confirmedSig := ""
-		for _, sig := range sigs {
-			claimed, err := w.DB.ClaimSignature(ctx, p.ID, sig)
-			if err != nil {
-				return err
-			}
-			if !claimed {
-				// already recorded: include its delta in the running total
-			}
-			tx, err := w.Detector.Transaction(ctx, sig, p.Reference, "confirmed")
-			if err != nil {
-				if chain.IsNotFound(err) {
-					continue
-				}
-				return err
-			}
-			total += tx.RecipientDeltaLamports
-			confirmedSig = sig
-		}
-		if total == 0 {
+		if balance == 0 {
 			return nil
 		}
-		if p.Status == "pending" {
-			if err := w.DB.MarkProcessing(ctx, p.ID, confirmedSig); err != nil {
-				return err
+		if balance < p.AmountBase {
+			// nothing (or a partial payment) so far: keep watching
+			if p.Status == "pending" {
+				if err := w.DB.MarkProcessing(ctx, p.ID, ""); err != nil {
+					return err
+				}
+				w.transition("pending", "processing", "")
 			}
-			w.transition("pending", "processing", "")
+			return nil
 		}
-		if total >= p.AmountBase {
-			return w.confirmDeposit(ctx, p, confirmedSig)
+		// balance >= amount (or a full payment arrived while pending):
+		// sweep, then confirm. Record an incoming signature for the receipt
+		// if one is visible (best effort).
+		sig := ""
+		if sigs, err := w.Detector.SignaturesForAddress(ctx, p.Reference); err == nil && len(sigs) > 0 {
+			sig = sigs[0]
 		}
-		return nil // partial payment so far; keep watching
+		return w.sweepDeposit(ctx, p, sig)
 
 	case "confirmed":
-		return w.sweepDeposit(ctx, p, keyRow)
+		return w.awaitSweep(ctx, p)
 	}
 	return nil
 }
 
-func (w *Watcher) confirmDeposit(ctx context.Context, p *store.Payment, sig string) error {
-	if err := w.DB.ConfirmPayment(ctx, p.ID, sig, w.now()); err != nil {
+// sweepDeposit sends the vault sweep and marks the payment confirmed.
+func (w *Watcher) sweepDeposit(ctx context.Context, p *store.Payment, incomingSig string) error {
+	if w.Sweeper == nil {
+		w.Log.Warn("deposit funds present but no sweeper configured",
+			"payment_id", p.ID, "reference", p.Reference)
+		return nil
+	}
+	sweepSig, err := w.Sweeper.SweepVault(ctx, p.ID)
+	if err != nil {
+		// transient: retried next tick while the payment stays watchable
+		w.Log.Error("sweep send failed", "payment_id", p.ID, "reference", p.Reference, "err", err.Error())
+		return nil
+	}
+	if err := w.DB.ConfirmDeposit(ctx, p.ID, incomingSig, sweepSig, w.now()); err != nil {
 		return err
 	}
 	w.transition("processing", "confirmed", "")
 	if err := w.DB.EnqueueWebhook(ctx, p.ID, "payment.confirmed"); err != nil {
 		return err
 	}
-	w.Log.Info("deposit payment confirmed", "payment_id", p.ID, "reference", p.Reference, "tx", sig)
-	keyRow, err := w.DB.GetDepositKey(ctx, p.ID)
+	w.Log.Info("deposit payment confirmed; sweep sent",
+		"payment_id", p.ID, "reference", p.Reference, "sweep_tx", sweepSig)
+	return nil
+}
+
+// awaitSweep finalizes once the sweep has LANDED; a sweep that failed
+// on-chain or was dropped is re-sent. A merely-unfinalized sweep is left
+// alone until finality.
+func (w *Watcher) awaitSweep(ctx context.Context, p *store.Payment) error {
+	if p.SweepTx == "" {
+		return w.sweepDeposit(ctx, p, p.TxSignature)
+	}
+	state, err := w.Sweeper.CheckSweep(ctx, p.SweepTx)
 	if err != nil {
 		return err
 	}
-	if keyRow == nil {
-		return nil
-	}
-	return w.sweepDeposit(ctx, p, keyRow)
-}
-
-// sweepDeposit sends the deposit balance to the merchant wallet and, on a
-// later tick once the sweep finalizes, marks the payment finalized.
-func (w *Watcher) sweepDeposit(ctx context.Context, p *store.Payment, keyRow *store.DepositKeyRow) error {
-	if w.Sweeper == nil {
-		w.Log.Warn("deposit payment confirmed but no sweeper configured",
-			"payment_id", p.ID, "reference", p.Reference)
-		return nil
-	}
-	if p.SweepTx != "" {
-		done, err := w.Sweeper.Finalized(ctx, p.SweepTx)
-		if err != nil {
-			return err
-		}
-		if !done {
-			return nil
-		}
+	switch state {
+	case SweepLanded:
 		if err := w.DB.FinalizePayment(ctx, p.ID, w.now()); err != nil {
 			return err
 		}
@@ -120,59 +121,45 @@ func (w *Watcher) sweepDeposit(ctx context.Context, p *store.Payment, keyRow *st
 		if err := w.DB.EnqueueWebhook(ctx, p.ID, "payment.finalized"); err != nil {
 			return err
 		}
-		w.Log.Info("deposit payment finalized (swept)", "payment_id", p.ID,
-			"reference", p.Reference, "sweep_tx", p.SweepTx)
+		w.Log.Info("deposit payment finalized (sweep landed)",
+			"payment_id", p.ID, "reference", p.Reference, "sweep_tx", p.SweepTx)
+		return nil
+	case SweepFailed:
+		balancer, ok := w.Detector.(DepositBalanceReader)
+		if !ok {
+			return nil
+		}
+		balance, err := balancer.GetBalance(ctx, p.Reference)
+		if err != nil {
+			return err
+		}
+		if balance > 0 {
+			w.Log.Warn("sweep failed on-chain; vault still holds funds, re-sending",
+				"payment_id", p.ID, "reference", p.Reference, "old_sweep_tx", p.SweepTx)
+			return w.sweepDeposit(ctx, p, p.TxSignature)
+		}
+		return nil
+	default: // SweepPending
 		return nil
 	}
-	secret, err := wallet.DecryptSecret(keyRow.EncryptedSecret, w.MasterKey)
-	if err != nil {
-		return err
-	}
-	sig, err := w.Sweeper.Sweep(ctx, secret)
-	if err != nil {
-		w.Log.Error("sweep failed", "payment_id", p.ID, "reference", p.Reference, "err", err.Error())
-		return nil // retried next tick
-	}
-	if err := w.DB.SetSweepTx(ctx, p.ID, sig); err != nil {
-		return err
-	}
-	w.Log.Info("deposit swept to merchant", "payment_id", p.ID,
-		"reference", p.Reference, "sweep_tx", sig)
-	return nil
 }
 
-// SweepLateDeposit handles an expired deposit payment whose funds arrived
-// after expiry: custodial mode must still deliver the money. Re-confirming
-// re-enters the normal sweep path.
+// SweepLateDeposit handles any deposit payment whose vault still holds
+// funds — expired, lapsed or otherwise. Money in a vault must always reach
+// the merchant; state bookkeeping follows the money.
 func (w *Watcher) SweepLateDeposit(ctx context.Context, p *store.Payment) error {
-	keyRow, err := w.DB.GetDepositKey(ctx, p.ID)
-	if err != nil || keyRow == nil {
-		return err
-	}
 	balancer, ok := w.Detector.(DepositBalanceReader)
 	if !ok {
 		return nil
 	}
 	balance, err := balancer.GetBalance(ctx, p.Reference)
-	if err != nil {
+	if err != nil || balance == 0 {
 		return err
 	}
-	if balance == 0 {
-		return nil
+	w.Log.Warn("late funds in vault; sweeping",
+		"payment_id", p.ID, "reference", p.Reference, "balance", balance, "status", p.Status)
+	if p.Status == "confirmed" {
+		return w.awaitSweep(ctx, p)
 	}
-	if err := w.DB.MarkDetectedConfirmed(ctx, p.ID, p.TxSignature, time.Now().UTC()); err != nil {
-		return err
-	}
-	w.transition("expired", "confirmed", "")
-	if err := w.DB.EnqueueWebhook(ctx, p.ID, "payment.confirmed"); err != nil {
-		return err
-	}
-	w.Log.Warn("late funds on expired deposit payment; sweeping",
-		"payment_id", p.ID, "reference", p.Reference, "balance", balance)
-	return w.sweepDeposit(ctx, &store.Payment{ID: p.ID, Reference: p.Reference, Status: "confirmed"}, keyRow)
-}
-
-// DepositBalanceReader is the optional balance capability of a Detector.
-type DepositBalanceReader interface {
-	GetBalance(ctx context.Context, address string) (uint64, error)
+	return w.sweepDeposit(ctx, p, p.TxSignature)
 }

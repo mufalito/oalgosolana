@@ -14,25 +14,40 @@ handler runs, so `sweep` to any other wallet fails with a named
 
 ## Instructions
 
-Anchor discriminants: first 8 bytes of `sha256("global:<name>")`.
+There is exactly ONE instruction. Anchor discriminant: first 8 bytes of
+`sha256("global:sweep")`.
 
 | Method | Accounts | Effect |
 |---|---|---|
-| `create_vault(cold_wallet: Pubkey)` | `[vault (init, seeds=["vault", seed], payer), seed key, payer (signer), system]` | Creates the PDA, stores `cold_wallet ‖ seed_key` (8B discriminator + 64B) |
-| `sweep` | `[vault (seeds), cold_wallet (mut, == vault.cold_wallet)]` | Moves all lamports above the rent-exempt minimum to the stored cold wallet via direct lamport adjustment |
+| `sweep(invoice_id: [u8;16])` | `[vault (SystemAccount, seeds=["vault", merchant, invoice_id]), merchant (mut), system]` | Transfers the vault's ENTIRE balance to the merchant via system-program CPI signed by the PDA; the account ends at 0 lamports and closes |
+
+## Design: derived vaults
+
+A vault address is `PDA(["vault", merchant, invoice_id])`. It does NOT exist
+on-chain until the customer's own SOL transfer creates it (the customer's
+payment pays the account rent). Because the account is system-owned, the
+program can sweep it via a system-program CPI under its PDA signature — no
+`create_vault`, no stored state, no per-invoice secrets, and no create
+transaction that could fail silently or be front-run (a v1-style create
+whose cold-wallet argument is attacker-chosen is impossible here: the
+destination is part of the address).
+
+Full drain: the sweep moves every lamport including the rent and the account
+closes. Nothing is stranded.
 
 ## Threat model
 
-- **Gateway server fully compromised:** attacker can create vaults, pay
-  rent, and call `sweep` — funds still land in the cold wallet. They can
-  withhold sweeps (DoS) and burn hot-wallet SOL on fees. They cannot
-  redirect payments or drain vaults.
+- **Gateway server fully compromised:** the attacker can hand customers
+  different addresses for NEW invoices (detectable: the merchant can
+  recompute every valid address offline), withhold sweeps (DoS), and burn
+  hot-wallet SOL on fees. They cannot redirect or steal money already in a
+  vault, and cannot change any vault's destination.
 - **Program upgrade authority compromised:** attacker can upgrade the
   program and drain all vaults. **Mitigate by revoking or multi-sig-ing the
   upgrade authority after deployment** (`solana program set-upgrade-authority
   --final` makes the program immutable).
-- No instruction closes vaults or reclaims rent (prototype); the rent-exempt
-  minimum (~0.0001 SOL for 72B data) is locked while the vault lives.
+- Anyone may call `sweep` — safe by construction, and it lets the merchant
+  run an independent sweeper as a checkpoint on the gateway.
 
 ## Build & deploy
 
@@ -53,13 +68,15 @@ Then set `DEPOSIT_PROGRAM_ID=<PROGRAM_ID>`,
 
 ## Verified live (devnet)
 
-Program `HJfP8oj6MyigUYo3LHnk8JHRA11xMWDwQ1uxVoCuB1M4`:
-- create → plain payment → sweep → cold wallet received the exact amount,
-  vault back at rent minimum
-- hostile `sweep` to a different destination: rejected on-chain with
-  `AnchorError ... Error Code: WrongColdWallet` before handler code runs
-- gateway e2e: invoice → vault created at payment time → plain transfer →
-  `confirmed` → swept → `finalized`; cold wallet balance exact to the lamport
+Program `6eASRQNLVAwpZGremorEuZwNu2tSYUrDbMUoih7BUx8g` (v2, derived vaults):
+- invoice → derived address only (nothing on-chain) → plain transfer
+  creates the vault → sweep → merchant received the full amount including
+  rent; vault ends at 0 lamports
+- hostile `sweep` naming a different merchant: rejected on-chain
+  (`AnchorError ... ConstraintSeeds` — the passed vault does not match the
+  address derived from the attacker's merchant)
+- gateway e2e: invoice → plain transfer → `confirmed` → sweep → `finalized`
+  in ~4s; merchant balance exact to the lamport
 
 ## Audits
 

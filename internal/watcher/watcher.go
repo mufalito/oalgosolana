@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,7 +39,9 @@ type WatcherConfig struct {
 	USDCMint           string
 	PollInterval       time.Duration
 	Workers            int
-	Clock              func() time.Time // injectable for tests
+	// DepositMode routes all payments through the derived-vault flow.
+	DepositMode bool
+	Clock       func() time.Time // injectable for tests
 }
 
 func (w *Watcher) now() time.Time {
@@ -64,30 +67,48 @@ func (w *Watcher) Run(ctx context.Context) error {
 	}
 }
 
-// pollOnce claims due payments and processes them concurrently. Claims use
-// FOR UPDATE SKIP LOCKED semantics via TryClaim so replicas are safe.
+// pollOnce processes every due payment, paged by id cursor so old unpaid
+// invoices cannot starve newer ones. Confirmed payments stay watchable past
+// expires_at until finalized (deposit sweeps / finality escalation).
+// NOTE: rows are not row-locked across the (long) RPC calls; run one
+// watcher per database in deposit/reference mode today.
 func (w *Watcher) pollOnce(ctx context.Context) error {
-	payments, err := w.DB.QueryPayments(ctx, `SELECT `+store.PaymentCols+`
-		FROM payments WHERE status IN ('pending','processing','confirmed') AND expires_at > now()
-		ORDER BY id LIMIT 50`)
-	if err != nil {
-		return fmt.Errorf("claim: %w", err)
-	}
-	if len(payments) == 0 {
-		return nil
-	}
 	sem := make(chan struct{}, max(1, w.Cfg.Workers))
 	var wg sync.WaitGroup
-	for _, p := range payments {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(p *store.Payment) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			if err := w.process(ctx, p); err != nil && !errors.Is(err, context.Canceled) {
-				w.Log.Error("process payment failed", "payment_id", p.ID, "reference", p.Reference, "err", err.Error())
-			}
-		}(p)
+	const baseQuery = `SELECT ` + store.PaymentCols + `
+		FROM payments
+		WHERE (status IN ('pending','processing') AND expires_at > now())
+		   OR status = 'confirmed'
+		ORDER BY id`
+	cursor := ""
+	for {
+		query := baseQuery + ` LIMIT 50`
+		var args []any
+		if cursor != "" {
+			// page past the last processed id (id > cursor), keeping the
+			// LIMIT applied
+			query = strings.Replace(baseQuery, "WHERE", "WHERE id > $1 AND", 1) + ` LIMIT 50`
+			args = append(args, cursor)
+		}
+		payments, err := w.DB.QueryPayments(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("claim: %w", err)
+		}
+		for _, p := range payments {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(p *store.Payment) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				if err := w.process(ctx, p); err != nil && !errors.Is(err, context.Canceled) {
+					w.Log.Error("process payment failed", "payment_id", p.ID, "reference", p.Reference, "err", err.Error())
+				}
+			}(p)
+		}
+		if len(payments) < 50 {
+			break
+		}
+		cursor = payments[len(payments)-1].ID
 	}
 	wg.Wait()
 	return nil
@@ -95,12 +116,7 @@ func (w *Watcher) pollOnce(ctx context.Context) error {
 
 // process advances one payment by one step of the state machine.
 func (w *Watcher) process(ctx context.Context, p *store.Payment) error {
-	// Deposit-address payments follow the custodial flow.
-	hasKey, err := w.DB.HasDepositKey(ctx, p.ID)
-	if err != nil {
-		return err
-	}
-	if hasKey {
+	if w.Cfg.DepositMode {
 		return w.processDeposit(ctx, p)
 	}
 	switch p.Status {
@@ -110,16 +126,30 @@ func (w *Watcher) process(ctx context.Context, p *store.Payment) error {
 			return fmt.Errorf("signatures: %w", err)
 		}
 		for _, sig := range sigs {
-			// Claim the (payment, signature) pair idempotently; other
-			// workers/replicas that saw the same signature do nothing.
+			// Claim the (payment, signature) pair idempotently; a signature
+			// is only ever considered once.
 			claimed, err := w.DB.ClaimSignature(ctx, p.ID, sig)
 			if err != nil {
 				return err
 			}
 			if !claimed {
-				continue // already processed by someone else
+				continue // already processed
 			}
-			// Record the candidate and move to processing atomically.
+			tx, err := w.Detector.Transaction(ctx, sig, p.MerchantWallet, "confirmed")
+			if err != nil {
+				if chain.IsNotFound(err) {
+					return nil // not indexed yet; retry next tick
+				}
+				return fmt.Errorf("tx fetch: %w", err)
+			}
+			if r := chain.Validate(tx, p, w.Cfg.USDCMint); r.Failed() {
+				// A bad candidate (stray transfer, wrong amount) must NOT
+				// doom the invoice: claim the signature and keep looking so
+				// the real payment still confirms.
+				w.Log.Warn("skipping invalid candidate tx",
+					"payment_id", p.ID, "reference", p.Reference, "tx", sig, "reason", string(r))
+				continue
+			}
 			if err := w.DB.MarkProcessing(ctx, p.ID, sig); err != nil {
 				return err
 			}

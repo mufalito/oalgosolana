@@ -67,8 +67,8 @@ func (r *Reaper) sweepLateDeposits(ctx context.Context) {
 	}
 	payments, err := r.DB.QueryPayments(ctx, `SELECT `+store.PaymentCols+`
 		FROM payments p
-		WHERE p.status='expired' AND p.sweep_tx=''
-		  AND EXISTS (SELECT 1 FROM deposit_keys k WHERE k.payment_id = p.id)
+		WHERE p.status <> 'finalized'
+		  AND p.expires_at < now()
 		  AND p.expires_at > now() - interval '1 day'
 		LIMIT 50`)
 	if err != nil {

@@ -1,99 +1,92 @@
-// Package vault builds transactions for the deposit-vault program
-// (vault-program/): PDAs that can only release funds to the cold wallet
-// fixed at creation. The gateway holds a hot wallet key that can create
-// vaults and trigger sweeps but can never redirect funds.
+// Package vault is the gateway client for the deposit-vault program v2
+// (vault-program/): derived vaults. A vault is the PDA
+// ["vault", merchant, invoice_id]; it never exists on-chain until the
+// customer's payment creates it. sweep moves the ENTIRE balance to the
+// merchant embedded in the seeds — no create instruction, no stored state,
+// no way to redirect funds. The hot wallet only pays tx fees.
 package vault
 
 import (
 	"context"
 	"crypto/sha256"
-	"fmt"
 
 	"github.com/gagliardetto/solana-go"
+	"github.com/google/uuid"
 
 	"github.com/mufalito/oalgosolana/internal/chain"
 )
 
-// Anchor instruction discriminants: first 8 bytes of
-// sha256("global:<method_name>"). Computed from vault-anchor/src/lib.rs.
-var (
-	DiscCreate = anchorSighash("global:create_vault")
-	DiscSweep  = anchorSighash("global:sweep")
-)
+// Anchor instruction discriminant: sha256("global:sweep")[0..8].
+var discSweep = anchorSighash("global:sweep")
 
 func anchorSighash(name string) []byte {
 	h := sha256.Sum256([]byte(name))
 	return h[:8]
 }
 
-// VaultSeed is the PDA seed prefix used by the program.
-var VaultSeed = []byte("vault")
-
-// Address derives the vault PDA for a seed key.
-func Address(seed solana.PublicKey, programID solana.PublicKey) (solana.PublicKey, error) {
-	pk, _, err := solana.FindProgramAddress([][]byte{VaultSeed, seed.Bytes()}, programID)
+// Address derives the vault PDA for a merchant and invoice id (UUID string).
+func Address(merchant solana.PublicKey, invoiceID string, programID solana.PublicKey) (solana.PublicKey, error) {
+	id, err := InvoiceIDBytes(invoiceID)
+	if err != nil {
+		return solana.PublicKey{}, err
+	}
+	pk, _, err := solana.FindProgramAddress(
+		[][]byte{[]byte("vault"), merchant.Bytes(), id[:]}, programID)
 	return pk, err
 }
 
-// CreateInstruction builds the create_vault instruction. Accounts:
-// [vault PDA (writable), seed key, payer (signer, writable), system].
-func CreateInstruction(programID, seed, coldWallet, payer solana.PublicKey) (solana.Instruction, solana.PublicKey, error) {
-	vaultAddr, err := Address(seed, programID)
+// InvoiceIDBytes parses a UUID string into its 16 raw bytes.
+func InvoiceIDBytes(invoiceID string) ([16]byte, error) {
+	var b [16]byte
+	id, err := uuid.Parse(invoiceID)
 	if err != nil {
-		return nil, vaultAddr, err
+		return b, err
 	}
-	data := make([]byte, 0, 8+32)
-	data = append(data, DiscCreate...)
-	data = append(data, coldWallet.Bytes()...)
-	return solana.NewInstruction(
-		programID,
-		solana.AccountMetaSlice{
-			{PublicKey: vaultAddr, IsWritable: true, IsSigner: false},
-			{PublicKey: seed, IsWritable: false, IsSigner: false},
-			{PublicKey: payer, IsWritable: true, IsSigner: true},
-			{PublicKey: solana.SystemProgramID},
-		},
-		data,
-	), vaultAddr, nil
+	copy(b[:], id[:])
+	return b, nil
 }
 
-// Sweeper creates vaults and sweeps them via the on-chain program.
+// Sweeper triggers sweeps of derived vaults (hot wallet pays fees only).
 type Sweeper struct {
-	RPC        *chain.RPCDetector
-	ProgramID  solana.PublicKey
-	HotWallet  solana.PrivateKey
-	ColdWallet solana.PublicKey
+	RPC       *chain.RPCDetector
+	ProgramID solana.PublicKey
+	Merchant  solana.PublicKey
+	HotWallet solana.PrivateKey
 }
 
-// CreateVault deploys a new vault PDA for the seed key; returns its address.
-func (s *Sweeper) CreateVault(ctx context.Context, seed solana.PublicKey) (solana.PublicKey, error) {
-	ix, vaultAddr, err := CreateInstruction(s.ProgramID, seed, s.ColdWallet, s.HotWallet.PublicKey())
+// SweepVault sends the sweep instruction for an invoice's vault and returns
+// the sweep signature. Safe for anyone to call: funds go only to the
+// merchant bound in the vault's seeds.
+func (s *Sweeper) SweepVault(ctx context.Context, invoiceID string) (string, error) {
+	id, err := InvoiceIDBytes(invoiceID)
 	if err != nil {
-		return vaultAddr, err
+		return "", err
 	}
-	if _, err := s.sendTx(ctx, ix); err != nil {
-		return vaultAddr, fmt.Errorf("create vault: %w", err)
+	vaultAddr, err := Address(s.Merchant, invoiceID, s.ProgramID)
+	if err != nil {
+		return "", err
 	}
-	return vaultAddr, nil
-}
-
-// Sweep triggers the program's sweep for a vault; funds go to the cold wallet
-// hardcoded in the vault (the hot wallet cannot redirect them).
-func (s *Sweeper) Sweep(ctx context.Context, vaultAddr solana.PublicKey) (string, error) {
+	data := make([]byte, 0, 8+16)
+	data = append(data, discSweep...)
+	data = append(data, id[:]...)
 	ix := solana.NewInstruction(
 		s.ProgramID,
 		solana.AccountMetaSlice{
 			{PublicKey: vaultAddr, IsWritable: true, IsSigner: false},
-			{PublicKey: s.ColdWallet, IsWritable: true, IsSigner: false},
+			{PublicKey: s.Merchant, IsWritable: true, IsSigner: false},
 			{PublicKey: solana.SystemProgramID},
 		},
-		DiscSweep,
+		data,
 	)
 	return s.sendTx(ctx, ix)
 }
 
 func (s *Sweeper) sendTx(ctx context.Context, ix solana.Instruction) (string, error) {
-	bh, err := s.blockhash(ctx)
+	bhs, err := s.RPC.GetLatestBlockhash(ctx)
+	if err != nil {
+		return "", err
+	}
+	bh, err := solana.HashFromBase58(bhs)
 	if err != nil {
 		return "", err
 	}
@@ -118,60 +111,26 @@ func (s *Sweeper) sendTx(ctx context.Context, ix solana.Instruction) (string, er
 	return s.RPC.SendTransaction(ctx, wire)
 }
 
-func (s *Sweeper) blockhash(ctx context.Context) (solana.Hash, error) {
-	bhs, err := s.RPC.GetLatestBlockhash(ctx)
-	if err != nil {
-		return solana.Hash{}, err
-	}
-	return solana.HashFromBase58(bhs)
-}
-
-// SeedFromSecret reverses the gateway's storage convention: in vault mode the
-// encrypted "secret" holds the 32-byte seed pubkey (there is no private key).
-func SeedFromSecret(b []byte) (solana.PublicKey, error) {
-	if len(b) != 32 {
-		return solana.PublicKey{}, fmt.Errorf("seed must be 32 bytes")
-	}
-	var pk solana.PublicKey
-	copy(pk[:], b)
-	return pk, nil
-}
-
-// DepositSweeperAdapter adapts the vault program sweeper to the watcher's
-// DepositSweeper interface. In vault mode the decrypted "secret" is the
-// 32-byte vault seed pubkey (no private key exists).
-type DepositSweeperAdapter struct {
-	S *Sweeper
-}
-
-func (a *DepositSweeperAdapter) Sweep(ctx context.Context, secret []byte) (string, error) {
-	seed, err := SeedFromSecret(secret)
+// SweepState classifies a sent sweep: "pending" (in flight), "landed"
+// (finalized successfully) or "failed" (errored on-chain or dropped).
+func (s *Sweeper) SweepState(ctx context.Context, sig string) (string, error) {
+	statuses, err := s.RPC.GetSignatureStatuses(ctx, []string{sig})
 	if err != nil {
 		return "", err
-	}
-	addr, err := Address(seed, a.S.ProgramID)
-	if err != nil {
-		return "", err
-	}
-	return a.S.Sweep(ctx, addr)
-}
-
-func (a *DepositSweeperAdapter) Finalized(ctx context.Context, sig string) (bool, error) {
-	statuses, err := a.S.RPC.GetSignatureStatuses(ctx, []string{sig})
-	if err != nil {
-		return false, err
 	}
 	if len(statuses) == 0 || statuses[0] == nil {
-		return false, nil
+		// not in the status cache: treat as dropped after the fact; the
+		// caller only re-sends when the vault still holds funds, which is
+		// harmless if the sweep is merely slow (double sweep of a partial
+		// drain is safe — the second transfer just finds less or nothing).
+		return "failed", nil
 	}
-	return statuses[0].ConfirmationStatus == "finalized", nil
-}
-
-// NewSeed generates a fresh random seed pubkey for a vault.
-func NewSeed() (solana.PublicKey, error) {
-	kp, err := solana.NewRandomPrivateKey()
-	if err != nil {
-		return solana.PublicKey{}, err
+	st := statuses[0]
+	if st.Err != nil {
+		return "failed", nil
 	}
-	return kp.PublicKey(), nil
+	if st.ConfirmationStatus == "finalized" {
+		return "landed", nil
+	}
+	return "pending", nil
 }

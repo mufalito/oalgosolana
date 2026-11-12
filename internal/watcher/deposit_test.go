@@ -2,134 +2,138 @@ package watcher
 
 import (
 	"context"
-	"encoding/hex"
-	"fmt"
 	"log/slog"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/mufalito/oalgosolana/internal/chain"
 	"github.com/mufalito/oalgosolana/internal/store"
-	"github.com/mufalito/oalgosolana/internal/wallet"
 )
 
-// fakeSweeper records sweep calls.
-type fakeSweeper struct {
-	swept     []string // deposit pubkeys swept
-	sweepSig  string
-	finalized bool
-	calls     int
+// fakeVaultSweeper implements DepositSweeper and records sweeps per invoice.
+type fakeVaultSweeper struct {
+	mu        sync.Mutex
+	swept     map[string]int // invoice id -> sweep attempts
+	sigFor    map[string]string
+	state     map[string]SweepState // sweep sig -> state
+	failSweep bool
 }
 
-func (f *fakeSweeper) Sweep(_ context.Context, secret []byte) (string, error) {
-	if len(secret) != 32 {
-		return "", fmt.Errorf("secret must be 32-byte seed, got %d", len(secret))
+func newFakeSweeper() *fakeVaultSweeper {
+	return &fakeVaultSweeper{swept: map[string]int{}, sigFor: map[string]string{}, state: map[string]SweepState{}}
+}
+
+func (f *fakeVaultSweeper) SweepVault(_ context.Context, invoiceID string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failSweep {
+		return "", errBoom
 	}
-	f.swept = append(f.swept, base58ish(secret))
-	f.calls++
-	return "sweep_sig_" + base58ish(secret), nil
+	f.swept[invoiceID]++
+	sig := "sweep_" + invoiceID[:8] + "_" + itoa(f.swept[invoiceID])
+	f.sigFor[invoiceID] = sig
+	f.state[sig] = SweepPending // in flight
+	return sig, nil
 }
 
-func base58ish(b []byte) string { return hex.EncodeToString(b)[:16] }
-
-func (f *fakeSweeper) Finalized(_ context.Context, sig string) (bool, error) {
-	return sig == f.sweepSig && f.finalized, nil
+func (f *fakeVaultSweeper) CheckSweep(_ context.Context, sig string) (SweepState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.state[sig], nil
 }
 
-// depositDetector reports one incoming transfer of fullAmount to the deposit
-// address and serves the balance reader interface.
+var errBoom = boom{}
+
+type boom struct{}
+
+func (boom) Error() string { return "sweep send failed" }
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b [8]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(b[i:])
+}
+
+// depositDetector serves balances and one incoming signature.
 type depositDetector struct {
 	fakeDetector
-	depositAddr string
-	fullAmount  uint64
-	balance     uint64
-}
-
-func (d *depositDetector) SignaturesForAddress(_ context.Context, ref string) ([]string, error) {
-	if ref == d.depositAddr {
-		return []string{"incoming_sig_1"}, nil
-	}
-	return nil, nil
-}
-
-func (d *depositDetector) Transaction(_ context.Context, sig, recipient, _ string) (*chain.TxInfo, error) {
-	if sig != "incoming_sig_1" {
-		return nil, &chain.NotFoundError{Method: "getTransaction"}
-	}
-	return &chain.TxInfo{
-		Signature: sig, RecipientDeltaLamports: d.fullAmount,
-		TokenDeltas: map[string]uint64{},
-		AccountKeys: []string{"SomeSender11111111111111111111111111111111111", recipient},
-	}, nil
+	vaultAddr string
+	balance   uint64
 }
 
 func (d *depositDetector) GetBalance(_ context.Context, addr string) (uint64, error) {
-	if addr == d.depositAddr {
+	if addr == d.vaultAddr {
 		return d.balance, nil
 	}
 	return 0, nil
 }
 
-func TestDepositFlowEndToEnd(t *testing.T) {
-	db := testDB(t)
-	ctx := context.Background()
+func (d *depositDetector) SignaturesForAddress(_ context.Context, ref string) ([]string, error) {
+	if ref == d.vaultAddr && d.balance > 0 {
+		return []string{"incoming_sig_1"}, nil
+	}
+	return nil, nil
+}
 
-	masterKey := make([]byte, 32)
-	for i := range masterKey {
-		masterKey[i] = byte(i)
+func newDepositWatcher(db *store.Store, det chain.Detector, swp *fakeVaultSweeper) *Watcher {
+	return &Watcher{
+		DB: db, Detector: det, Log: slog.New(slog.NewTextHandler(os.Stderr, nil)),
+		Sweeper: swp,
+		Cfg: WatcherConfig{
+			ConfirmationPolicy: "confirmed", PollInterval: time.Millisecond,
+			Workers: 2, DepositMode: true,
+		},
 	}
-	seed := make([]byte, 32)
-	for i := range seed {
-		seed[i] = byte(255 - i)
-	}
-	enc, err := wallet.EncryptSecret(seed, masterKey)
-	if err != nil {
-		t.Fatal(err)
-	}
+}
 
+func insertDepositPayment(t *testing.T, db *store.Store, status, sweepTx string, amount uint64) *store.Payment {
+	t.Helper()
 	p := &store.Payment{
 		ID: uuid.Must(uuid.NewV7()).String(), OrderID: "dep_" + uuid.NewString()[:8],
-		AmountBase: 50000000, Currency: "SOL", Status: "pending",
-		Reference: vaultRef(t, enc, masterKey), MerchantWallet: testMerchant,
+		AmountBase: amount, Currency: "SOL", Status: status,
+		Reference: "VaultAddr" + uuid.NewString()[:31], MerchantWallet: testMerchant,
 		WebhookURL: "https://example.com/hook",
 		ExpiresAt:  time.Now().Add(30 * time.Minute), CreatedAt: time.Now(),
+		SweepTx: sweepTx,
 	}
-	if err := db.CreatePayment(ctx, p); err != nil {
+	if err := db.CreatePayment(context.Background(), p); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.CreateDepositKey(ctx, &store.DepositKeyRow{
-		PaymentID: p.ID, PublicKey: p.Reference, EncryptedSecret: enc,
-	}); err != nil {
-		t.Fatal(err)
-	}
+	return p
+}
 
-	swp := &fakeSweeper{finalized: false}
-	det := &depositDetector{depositAddr: rowRef(t, db, p.ID), fullAmount: 50000000}
-	w := &Watcher{
-		DB: db, Detector: det, Log: logNop(t),
-		Sweeper: swp, MasterKey: masterKey,
-		Cfg: WatcherConfig{ConfirmationPolicy: "confirmed", PollInterval: time.Millisecond, Workers: 2},
-	}
+func TestDepositFlowBalanceToFinalized(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	p := insertDepositPayment(t, db, "pending", "", 20_000_000)
+	swp := newFakeSweeper()
+	det := &depositDetector{vaultAddr: p.Reference, balance: 20_000_000}
+	w := newDepositWatcher(db, det, swp)
 
-	// tick 1: pending -> processing -> confirmed (full amount arrived) + sweep sent
+	// tick 1: balance >= amount -> sweep sent + confirmed
 	if err := w.pollOnce(ctx); err != nil {
 		t.Fatal(err)
 	}
 	row, _ := db.GetPayment(ctx, uuid.MustParse(p.ID))
-	if row.Status != "confirmed" {
-		t.Fatalf("after tick1: %s", row.Status)
+	if row.Status != "confirmed" || row.ConfirmedAt == nil || row.SweepTx == "" {
+		t.Fatalf("after tick1: %+v", row)
 	}
-	if len(swp.swept) != 1 {
-		t.Fatalf("swept: %v", swp.swept)
+	if row.TxSignature != "incoming_sig_1" {
+		t.Fatalf("receipt signature = %q", row.TxSignature)
 	}
-	if row.SweepTx == "" {
-		t.Fatal("sweep tx not recorded")
-	}
-	swp.sweepSig = row.SweepTx
 
-	// tick 2: sweep not yet finalized -> stays confirmed
+	// tick 2: sweep not landed yet -> stays confirmed
 	if err := w.pollOnce(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -138,8 +142,10 @@ func TestDepositFlowEndToEnd(t *testing.T) {
 		t.Fatalf("after tick2: %s", row.Status)
 	}
 
-	// tick 3: sweep finalized -> payment finalized + webhooks
-	swp.finalized = true
+	// sweep lands -> finalized + webhooks
+	swp.mu.Lock()
+	swp.state[row.SweepTx] = SweepLanded
+	swp.mu.Unlock()
 	if err := w.pollOnce(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -149,33 +155,18 @@ func TestDepositFlowEndToEnd(t *testing.T) {
 	}
 	var n int
 	db.Pool.QueryRow(ctx, `SELECT count(*) FROM webhook_deliveries WHERE payment_id=$1`, p.ID).Scan(&n)
-	if n != 2 {
-		t.Fatalf("deliveries = %d, want 2", n)
+	if n != 2 { // confirmed + finalized
+		t.Fatalf("deliveries = %d", n)
 	}
 }
 
 func TestDepositPartialPaymentKeepsWatching(t *testing.T) {
 	db := testDB(t)
 	ctx := context.Background()
-	masterKey := make([]byte, 32)
-	seed := make([]byte, 32)
-	enc, _ := wallet.EncryptSecret(seed, masterKey)
-	_ = seed
-	p := &store.Payment{
-		ID: uuid.Must(uuid.NewV7()).String(), OrderID: "dep_" + uuid.NewString()[:8],
-		AmountBase: 50000000, Currency: "SOL", Status: "pending",
-		Reference: vaultRef(t, enc, masterKey), MerchantWallet: testMerchant,
-		ExpiresAt: time.Now().Add(30 * time.Minute), CreatedAt: time.Now(),
-	}
-	db.CreatePayment(ctx, p)
-	db.CreateDepositKey(ctx, &store.DepositKeyRow{
-		PaymentID: p.ID, PublicKey: p.Reference, EncryptedSecret: enc,
-	})
-
-	swp := &fakeSweeper{}
-	det := &depositDetector{depositAddr: rowRef(t, db, p.ID), fullAmount: 10000000} // 20% paid
-	w := &Watcher{DB: db, Detector: det, Log: logNop(t), Sweeper: swp, MasterKey: masterKey,
-		Cfg: WatcherConfig{ConfirmationPolicy: "confirmed", PollInterval: time.Millisecond, Workers: 2}}
+	p := insertDepositPayment(t, db, "pending", "", 20_000_000)
+	swp := newFakeSweeper()
+	det := &depositDetector{vaultAddr: p.Reference, balance: 5_000_000} // 25%
+	w := newDepositWatcher(db, det, swp)
 
 	for range 3 {
 		if err := w.pollOnce(ctx); err != nil {
@@ -186,65 +177,87 @@ func TestDepositPartialPaymentKeepsWatching(t *testing.T) {
 	if row.Status != "processing" {
 		t.Fatalf("partial payment must stay processing, got %s", row.Status)
 	}
-	if len(swp.swept) != 0 {
-		t.Fatal("must not sweep unconfirmed/partial payment")
+	swp.mu.Lock()
+	swept := len(swp.swept)
+	swp.mu.Unlock()
+	if swept != 0 {
+		t.Fatal("must not sweep a partial payment")
 	}
 }
 
-func TestSweepLateDepositAfterExpiry(t *testing.T) {
+func TestDepositFailedSweepIsResent(t *testing.T) {
 	db := testDB(t)
 	ctx := context.Background()
-	masterKey := make([]byte, 32)
-	seed := make([]byte, 32)
-	enc, _ := wallet.EncryptSecret(seed, masterKey)
-	_ = seed
+	p := insertDepositPayment(t, db, "pending", "", 20_000_000)
+	swp := newFakeSweeper()
+	det := &depositDetector{vaultAddr: p.Reference, balance: 20_000_000}
+	w := newDepositWatcher(db, det, swp)
+
+	// tick 1: sweep sent, confirmed
+	if err := w.pollOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	row, _ := db.GetPayment(ctx, uuid.MustParse(p.ID))
+	firstSig := row.SweepTx
+	if firstSig == "" || row.Status != "confirmed" {
+		t.Fatalf("tick1: %+v", row)
+	}
+
+	// pending sweep must NOT be re-sent
+	if err := w.pollOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	row, _ = db.GetPayment(ctx, uuid.MustParse(p.ID))
+	if row.SweepTx != firstSig {
+		t.Fatal("in-flight sweep must not be re-sent")
+	}
+
+	// the sweep FAILS on-chain: the vault still holds funds, so a new sweep
+	// must be sent on the next tick.
+	swp.mu.Lock()
+	swp.state[firstSig] = SweepFailed
+	swp.mu.Unlock()
+	if err := w.pollOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	row, _ = db.GetPayment(ctx, uuid.MustParse(p.ID))
+	if row.SweepTx == firstSig {
+		t.Fatal("failed sweep must be re-sent with a new signature")
+	}
+	swp.mu.Lock()
+	attempts := swp.swept[p.ID]
+	swp.mu.Unlock()
+	if attempts != 2 {
+		t.Fatalf("sweep attempts = %d, want 2", attempts)
+	}
+}
+
+func TestSweepLateDepositExpired(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
 	p := &store.Payment{
 		ID: uuid.Must(uuid.NewV7()).String(), OrderID: "dep_" + uuid.NewString()[:8],
-		AmountBase: 50000000, Currency: "SOL", Status: "expired",
-		Reference: vaultRef(t, enc, masterKey), MerchantWallet: testMerchant,
-		ExpiresAt: time.Now().Add(-time.Minute), CreatedAt: time.Now(),
+		AmountBase: 20_000_000, Currency: "SOL", Status: "expired",
+		Reference: "VaultAddr" + uuid.NewString()[:31], MerchantWallet: testMerchant,
+		WebhookURL: "https://example.com/hook",
+		ExpiresAt:  time.Now().Add(-time.Minute), CreatedAt: time.Now(),
 	}
 	db.CreatePayment(ctx, p)
-	db.CreateDepositKey(ctx, &store.DepositKeyRow{
-		PaymentID: p.ID, PublicKey: p.Reference, EncryptedSecret: enc,
-	})
-
-	swp := &fakeSweeper{}
-	det := &depositDetector{depositAddr: rowRef(t, db, p.ID), fullAmount: 50000000, balance: 50000000}
-	w := &Watcher{DB: db, Detector: det, Log: logNop(t), Sweeper: swp, MasterKey: masterKey,
-		Cfg: WatcherConfig{ConfirmationPolicy: "confirmed", PollInterval: time.Millisecond, Workers: 2}}
+	swp := newFakeSweeper()
+	det := &depositDetector{vaultAddr: p.Reference, balance: 20_000_000}
+	w := newDepositWatcher(db, det, swp)
 
 	if err := w.SweepLateDeposit(ctx, p); err != nil {
 		t.Fatal(err)
 	}
 	row, _ := db.GetPayment(ctx, uuid.MustParse(p.ID))
-	if row.Status != "confirmed" {
-		t.Fatalf("late deposit must be re-confirmed, got %s", row.Status)
+	if row.Status != "confirmed" || row.SweepTx == "" {
+		t.Fatalf("late deposit: %+v", row)
 	}
-	if len(swp.swept) != 1 {
-		t.Fatalf("late deposit must sweep, got %v", swp.swept)
+	swp.mu.Lock()
+	attempts := swp.swept[p.ID]
+	swp.mu.Unlock()
+	if attempts != 1 {
+		t.Fatalf("late deposit must sweep, attempts=%d", attempts)
 	}
-}
-
-func vaultRef(t *testing.T, enc, masterKey []byte) string {
-	t.Helper()
-	seed, err := wallet.DecryptSecret(enc, masterKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return base58ish(seed) // test-only stand-in pubkey
-}
-
-func rowRef(t *testing.T, db *store.Store, paymentID string) string {
-	t.Helper()
-	row, err := db.GetDepositKey(context.Background(), paymentID)
-	if err != nil || row == nil {
-		t.Fatalf("deposit key row: %v %v", row, err)
-	}
-	return row.PublicKey
-}
-
-func logNop(t *testing.T) *slog.Logger {
-	t.Helper()
-	return slog.New(slog.NewTextHandler(os.Stderr, nil))
 }

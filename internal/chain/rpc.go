@@ -278,16 +278,18 @@ func (d *RPCDetector) GetBalance(ctx context.Context, address string) (uint64, e
 	return out.Value, nil
 }
 
-// GetSignatureStatuses returns per-signature status (nil status = unknown).
-func (d *RPCDetector) GetSignatureStatuses(ctx context.Context, sigs []string) ([]*struct {
+// SignatureStatus is the parsed status of one signature (Err == nil means
+// the transaction succeeded on-chain).
+type SignatureStatus struct {
 	Slot               uint64 `json:"slot"`
 	ConfirmationStatus string `json:"confirmationStatus"`
-}, error) {
+	Err                any    `json:"err"`
+}
+
+// GetSignatureStatuses returns per-signature status (nil status = unknown).
+func (d *RPCDetector) GetSignatureStatuses(ctx context.Context, sigs []string) ([]*SignatureStatus, error) {
 	var out struct {
-		Value []*struct {
-			Slot               uint64 `json:"slot"`
-			ConfirmationStatus string `json:"confirmationStatus"`
-		} `json:"value"`
+		Value []*SignatureStatus `json:"value"`
 	}
 	list := make([]string, len(sigs))
 	for i, s := range sigs {
@@ -297,4 +299,17 @@ func (d *RPCDetector) GetSignatureStatuses(ctx context.Context, sigs []string) (
 		return nil, err
 	}
 	return out.Value, nil
+}
+
+// RentExemptMinimum returns the rent-exempt minimum for an empty (0-byte)
+// account, read live from RPC so rent changes (stepped cuts) are followed.
+func (d *RPCDetector) RentExemptMinimum(ctx context.Context) uint64 {
+	var out struct {
+		Value uint64 `json:"value"`
+	}
+	if err := d.call(ctx, &out, "getMinimumBalanceForRentExemptSize", 0); err != nil {
+		// conservative fallback: the long-standing pre-cut minimum
+		return 890880
+	}
+	return out.Value
 }
