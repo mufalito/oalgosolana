@@ -8,7 +8,7 @@ import (
 )
 
 // PaymentCols is the canonical column list for scanning payment rows.
-const PaymentCols = `id, order_id, amount_base, currency, status, reference, merchant_wallet,
+const PaymentCols = `id, order_id, amount_base, decimals, currency, status, reference, merchant_wallet,
 label, message, webhook_url, expires_at, created_at, tx_signature, detected_tx, sweep_tx,
 confirmed_at, finalized_at, failure_reason`
 

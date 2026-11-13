@@ -7,7 +7,8 @@ edition = "2021"
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
-anchor-lang = { git = "https://github.com/otter-sec/anchor", branch = "master" }
+anchor-lang = { git = "https://github.com/otter-sec/anchor", branch = "master", features = ["init-if-needed"] }
+anchor-spl = { git = "https://github.com/otter-sec/anchor", branch = "master" }
 
 [profile.release]
 lto = true

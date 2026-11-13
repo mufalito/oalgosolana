@@ -84,7 +84,7 @@ func BuildPayload(eventType string, p *store.Payment) Payload {
 		Type:        eventType,
 		PaymentID:   p.ID,
 		OrderID:     p.OrderID,
-		Amount:      solanapay.FormatAmount(p.AmountBase),
+		Amount:      solanapay.FormatAmount(p.AmountBase, p.Decimals),
 		AmountBase:  strconv.FormatUint(p.AmountBase, 10),
 		Currency:    p.Currency,
 		TxSignature: p.TxSignature,

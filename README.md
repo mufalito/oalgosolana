@@ -4,7 +4,7 @@ Self-hosted Solana payment gateway built around an **on-chain vault program**:
 every invoice gets a unique derived deposit address payable from any wallet
 or exchange — plain address + amount, no Solana Pay support, no reference,
 no memo — and funds can only ever leave a vault to the merchant's wallet,
-enforced on-chain.
+enforced on-chain. SOL plus any SPL tokens you allowlist (`ACCEPTED_MINTS`).
 
 **Status: prototype.** Core flow is live-tested on Solana devnet; the vault
 program is unaudited. Read [vault-program/README.md](vault-program/README.md)
@@ -29,6 +29,34 @@ The destination is baked into the address derivation, not passed as an
 argument — the gateway's hot wallet can pay fees and *ask* for sweeps, but
 cannot redirect or steal funds.
 
+### Tokens (SPL)
+
+Set `ACCEPTED_MINTS=<mint1>,<mint2>` to accept SPL payments. Each invoice's
+`currency` is then `"SOL"` or the mint address; amounts use the mint's
+decimals (read from RPC, stored per invoice). The customer's wallet creates
+the vault's token account as part of the payment (paying its rent in SOL,
+like any token send). `sweep_spl` transfers the full token balance to the
+merchant's ATA (created on first sweep if missing) and **closes the vault
+ATA, returning its rent**. The `solana_pay_url` carries `spl-token` for
+capable wallets; the raw `deposit_address` works everywhere else.
+
+Caveat: some exchanges/Ledger refuse token sends to derived addresses
+without an existing token account — test with the wallets your customers
+actually use.
+
+### Verifying addresses
+
+Vault addresses are pure derivation — recompute any of them offline and
+compare against what the gateway hands out (catches misconfiguration before
+customers pay):
+
+```sh
+go run ./cmd/derive -merchant <MERCHANT_WALLET> -program <DEPOSIT_PROGRAM_ID>   -invoice <payment_id> [-mint <mint>]
+```
+
+The server also logs a sample derivation at startup. Hot-wallet balance is
+exported as `hot_wallet_lamports` (sweeps stall when it hits zero).
+
 ## Security model
 
 - A full server compromise can: hand customers different addresses for NEW
@@ -49,15 +77,15 @@ rate limiting). Errors are `{"error":{"code":"...","message":"..."}}`.
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /api/v1/payments` | Create invoice (SOL; amount as decimal string) |
+| `POST /api/v1/payments` | Create invoice (SOL or allowlisted mint; amount as decimal string) |
 | `GET /api/v1/payments/{id}` | Status incl. sweep/payment signatures |
 | `POST /api/v1/payments/{id}/webhook/replay` | Requeue dead/pending deliveries |
 | `GET /healthz` `/readyz` `/metrics` | Liveness, readiness (DB+RPC), Prometheus |
 
 Amounts: decimal strings at the API edge only; stored and compared as
-`uint64` lamports. Minimum invoice = the rent-exempt minimum for an empty
-account, read live from RPC (the customer's transfer must be able to create
-the vault).
+`uint64` base units (lamports, or the mint's smallest unit). SOL invoices
+have a minimum of the rent-exempt minimum for an empty account, read live
+from RPC (the customer's transfer must be able to create the vault).
 
 ## Payment lifecycle
 
@@ -148,5 +176,4 @@ unreachable, isolated per-package databases).
 ## Out of scope (by design)
 
 Multi-merchant support, dashboards, fee collection, refunds/withdrawals
-(merchants sign payouts from their own wallet), USDC/tokens (needs
-pre-created token accounts; revisit with an audited program).
+(merchants sign payouts from their own wallet).

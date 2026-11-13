@@ -36,10 +36,20 @@ type Config struct {
 	// Deposit mode uses on-chain vault program PDAs: funds can only ever
 	// leave to the cold wallet (see vault-program/).
 	DepositProgramID string `env:"DEPOSIT_PROGRAM_ID"`
-	// GatewayHotWallet: path to a JSON keypair paying vault rent + fees
-	// (vault backend only). It can create vaults and trigger sweeps but can
-	// never redirect funds.
 	GatewayHotWallet string `env:"GATEWAY_HOT_WALLET"`
+	// AcceptedMints: comma-separated base58 SPL mints customers may pay in
+	// (in addition to SOL). Empty = SOL only.
+	AcceptedMints []string `env:"ACCEPTED_MINTS" envSeparator:","`
+}
+
+// AcceptsMint reports whether the gateway accepts payments in this mint.
+func (c *Config) AcceptsMint(mint string) bool {
+	for _, m := range c.AcceptedMints {
+		if m == mint {
+			return true
+		}
+	}
+	return false
 }
 
 // Load parses the environment and validates invariants. It returns an error
@@ -93,6 +103,16 @@ func Load() (*Config, error) {
 	}
 	if cfg.GatewayHotWallet == "" {
 		errs = append(errs, "GATEWAY_HOT_WALLET: keypair path required")
+	}
+	seen := map[string]bool{}
+	for _, m := range cfg.AcceptedMints {
+		if _, err := solana.PublicKeyFromBase58(m); err != nil {
+			errs = append(errs, "ACCEPTED_MINTS: invalid base58 mint "+m)
+		}
+		if seen[m] {
+			errs = append(errs, "ACCEPTED_MINTS: duplicate mint "+m)
+		}
+		seen[m] = true
 	}
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("invalid configuration:\n  - %s", strings.Join(errs, "\n  - "))

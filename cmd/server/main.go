@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/mufalito/oalgosolana/internal/api"
@@ -33,6 +34,14 @@ type vaultAdapter struct{ S *vault.Sweeper }
 
 func (a *vaultAdapter) SweepVault(ctx context.Context, invoiceID string) (string, error) {
 	return a.S.SweepVault(ctx, invoiceID)
+}
+
+func (a *vaultAdapter) SweepSPL(ctx context.Context, invoiceID, mint string) (string, error) {
+	m, err := solana.PublicKeyFromBase58(mint)
+	if err != nil {
+		return "", err
+	}
+	return a.S.SweepSPL(ctx, invoiceID, m)
 }
 
 func (a *vaultAdapter) CheckSweep(ctx context.Context, sig string) (watcher.SweepState, error) {
@@ -82,6 +91,20 @@ func main() {
 	}
 	paySvc.DepositProgramID = programID
 	paySvc.DepositRentMinimum = detector.RentExemptMinimum
+	if len(cfg.AcceptedMints) > 0 {
+		paySvc.MintDecimals = detector.MintDecimals
+	}
+	// Address self-verification (config errors would otherwise silently
+	// send every invoice to a wrong-but-valid vault):
+	sample, err := vault.Address(cfg.MerchantWallet, "00000000-0000-0000-0000-000000000000", programID)
+	if err == nil {
+		log.Info("vault derivation self-check",
+			"merchant", cfg.MerchantWallet.String(),
+			"program", programID.String(),
+			"sample_invoice", "00000000-0000-0000-0000-000000000000",
+			"sample_vault", sample.String(),
+			"verify", "compare with `derive -merchant ... -program ... -invoice ...`")
+	}
 
 	replayer := func(ctx context.Context, paymentID string) error {
 		found, err := st.ReplayDelivery(ctx, paymentID)
@@ -150,6 +173,28 @@ func main() {
 		LateDepositSweeper: w.SweepLateDeposit,
 		OnExpired:          func(n int) { metrics.PaymentsExpired.Add(float64(n)) },
 	}
+
+	hotWalletGauge := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "hot_wallet_lamports", Help: "Gateway hot wallet balance (sweep fees/ATA rent).",
+	})
+	prometheus.MustRegister(hotWalletGauge)
+	go func() {
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		for {
+			if bal, err := detector.GetBalance(ctx, hw.PublicKey().String()); err == nil {
+				hotWalletGauge.Set(float64(bal))
+				if bal < 1_000_000 {
+					log.Warn("hot wallet nearly empty: sweeps will stall", "lamports", bal)
+				}
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+		}
+	}()
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return w.Run(gctx) })

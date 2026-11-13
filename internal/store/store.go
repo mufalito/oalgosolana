@@ -55,6 +55,7 @@ type Payment struct {
 	ID             string
 	OrderID        string
 	AmountBase     uint64
+	Decimals       int
 	Currency       string
 	Status         string
 	Reference      string

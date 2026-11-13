@@ -16,16 +16,22 @@ import (
 // SOLDecimals is lamports precision (10^9 lamports = 1 SOL).
 const SOLDecimals = 9
 
+// MaxDecimals bounds accepted mint precision.
+const MaxDecimals = 18
+
 var (
 	ErrInvalidAmount = errors.New("invalid amount")
 	maxUint64        = new(big.Int).SetUint64(^uint64(0))
 )
 
-// ParseAmount parses a decimal string like "1.50" into lamports (uint64)
-// using exact fixed-point arithmetic. It rejects signs, exponents, more than
-// 9 fractional digits, >18 integer digits, empty strings, and leading/
-// trailing junk. Never uses float64.
-func ParseAmount(s string) (uint64, error) {
+// ParseAmount parses a decimal string like "1.50" into base units at the
+// given decimals (9 for SOL, the mint's decimals for tokens) using exact
+// fixed-point arithmetic. It rejects signs, exponents, over-precision,
+// >18 integer digits, empty strings, and junk. Never uses float64.
+func ParseAmount(s string, decimals int) (uint64, error) {
+	if decimals < 0 || decimals > MaxDecimals {
+		return 0, fmt.Errorf("%w: invalid decimals %d", ErrInvalidAmount, decimals)
+	}
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return 0, fmt.Errorf("%w: empty string", ErrInvalidAmount)
@@ -46,8 +52,8 @@ func ParseAmount(s string) (uint64, error) {
 	if len(intPart) > 18 {
 		return 0, fmt.Errorf("%w: too many integer digits", ErrInvalidAmount)
 	}
-	if len(fracPart) > SOLDecimals {
-		return 0, fmt.Errorf("%w: more than %d fractional digits", ErrInvalidAmount, SOLDecimals)
+	if len(fracPart) > decimals {
+		return 0, fmt.Errorf("%w: more than %d fractional digits", ErrInvalidAmount, decimals)
 	}
 	value := new(big.Int)
 	if intPart != "0" || fracPart != "" {
@@ -58,9 +64,9 @@ func ParseAmount(s string) (uint64, error) {
 		}
 		value = v
 	}
-	scaleExp := SOLDecimals
+	scaleExp := decimals
 	if hasFrac {
-		scaleExp = SOLDecimals - len(fracPart)
+		scaleExp = decimals - len(fracPart)
 	}
 	value.Mul(value, pow10(scaleExp))
 	if value.Sign() == 0 {
@@ -72,14 +78,17 @@ func ParseAmount(s string) (uint64, error) {
 	return value.Uint64(), nil
 }
 
-// FormatAmount renders lamports as a plain decimal string,
-// e.g. 1500000000 -> "1.500000000".
-func FormatAmount(base uint64) string {
+// FormatAmount renders base units at the given decimals as a plain decimal
+// string, e.g. FormatAmount(1500000000, 9) -> "1.500000000".
+func FormatAmount(base uint64, decimals int) string {
 	div, mod := new(big.Int), new(big.Int)
-	div.DivMod(new(big.Int).SetUint64(base), pow10(SOLDecimals), mod)
+	div.DivMod(new(big.Int).SetUint64(base), pow10(decimals), mod)
+	if decimals == 0 {
+		return div.String()
+	}
 	frac := mod.String()
-	if len(frac) < SOLDecimals {
-		frac = strings.Repeat("0", SOLDecimals-len(frac)) + frac
+	if len(frac) < decimals {
+		frac = strings.Repeat("0", decimals-len(frac)) + frac
 	}
 	return div.String() + "." + frac
 }
@@ -108,10 +117,13 @@ var pow10Cache = func() [20]*big.Int {
 func pow10(n int) *big.Int { return pow10Cache[n] }
 
 // BuildURL constructs a Solana Pay transfer-request URL for a deposit vault:
-// solana:<address>?amount=<decimal>&label=...&message=...
-func BuildURL(address, label, message string, amountBase uint64) string {
+// solana:<address>?amount=<decimal>[&spl-token=<mint>]&label=...&message=...
+func BuildURL(address, label, message string, amountBase uint64, decimals int, mint string) string {
 	q := url.Values{}
-	q.Set("amount", FormatAmount(amountBase))
+	q.Set("amount", FormatAmount(amountBase, decimals))
+	if mint != "" {
+		q.Set("spl-token", mint)
+	}
 	if label != "" {
 		q.Set("label", label)
 	}

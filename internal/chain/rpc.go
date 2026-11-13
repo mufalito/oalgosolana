@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -194,4 +195,59 @@ func (d *RPCDetector) RentExemptMinimum(ctx context.Context) uint64 {
 		return 890880
 	}
 	return out.Value
+}
+
+// MintDecimals returns the decimals of an SPL mint (from the mint account).
+func (d *RPCDetector) MintDecimals(ctx context.Context, mint string) (uint8, error) {
+	var out struct {
+		Value struct {
+			Data struct {
+				Parsed struct {
+					Info struct {
+						Decimals uint8 `json:"decimals"`
+					} `json:"info"`
+				} `json:"parsed"`
+			} `json:"data"`
+		} `json:"value"`
+	}
+	if err := d.call(ctx, &out, "getAccountInfo", mint,
+		map[string]any{"encoding": "jsonParsed"}); err != nil {
+		return 0, err
+	}
+	return out.Value.Data.Parsed.Info.Decimals, nil
+}
+
+// GetTokenBalance returns the token balance (base units) of a token account;
+// 0 when the account does not exist.
+func (d *RPCDetector) GetTokenBalance(ctx context.Context, tokenAccount string) (uint64, error) {
+	var out struct {
+		Value struct {
+			Amount string `json:"amount"`
+		} `json:"value"`
+	}
+	if err := d.call(ctx, &out, "getTokenAccountBalance", tokenAccount,
+		map[string]any{"commitment": "confirmed"}); err != nil {
+		if IsTokenAccountNotFound(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return parseUint(out.Value.Amount), nil
+}
+
+// IsTokenAccountNotFound reports whether err is the RPC's "token account not
+// found" rejection (account simply doesn't exist yet).
+func IsTokenAccountNotFound(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "could not find account")
+}
+
+func parseUint(s string) uint64 {
+	var v uint64
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return 0
+		}
+		v = v*10 + uint64(r-'0')
+	}
+	return v
 }

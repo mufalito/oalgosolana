@@ -19,7 +19,8 @@ There is exactly ONE instruction. Anchor discriminant: first 8 bytes of
 
 | Method | Accounts | Effect |
 |---|---|---|
-| `sweep(invoice_id: [u8;16])` | `[vault (SystemAccount, seeds=["vault", merchant, invoice_id]), merchant (mut), system]` | Transfers the vault's ENTIRE balance to the merchant via system-program CPI signed by the PDA; the account ends at 0 lamports and closes |
+| `sweep(invoice_id: [u8;16])` | `[vault (SystemAccount, seeds), merchant (mut), system]` | Transfers the vault's ENTIRE SOL balance to the merchant via system-program CPI signed by the PDA; the account ends at 0 lamports and closes |
+| `sweep_spl(invoice_id: [u8;16])` | `[vault (seeds), vault_ata (authority=vault), merchant (mut), merchant_ata (init_if_needed, payer), mint, payer (signer), token, ata, system]` | Transfers the vault ATA's ENTIRE token balance to the merchant ATA, then closes the vault ATA — rent returned to the merchant |
 
 ## Design: derived vaults
 

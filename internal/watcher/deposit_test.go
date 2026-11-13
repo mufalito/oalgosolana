@@ -9,10 +9,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gagliardetto/solana-go"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/mufalito/oalgosolana/internal/chain"
 	"github.com/mufalito/oalgosolana/internal/store"
+	"github.com/mufalito/oalgosolana/internal/vault"
 )
 
 // fakeVaultSweeper implements DepositSweeper and records sweeps per invoice.
@@ -48,6 +50,11 @@ func (f *fakeVaultSweeper) CheckSweep(_ context.Context, sig string) (SweepState
 }
 
 const testMerchant = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"
+
+func logNop(t *testing.T) *slog.Logger {
+	t.Helper()
+	return slog.New(slog.NewTextHandler(os.Stderr, nil))
+}
 
 var errBoom = boom{}
 
@@ -295,4 +302,87 @@ func testDB(t *testing.T) *store.Store {
 		t.Fatal(err)
 	}
 	return st
+}
+
+func (f *fakeVaultSweeper) SweepSPL(ctx context.Context, invoiceID, mint string) (string, error) {
+	return f.SweepVault(ctx, invoiceID+":spl")
+}
+
+// tokenDetector serves token balances via the vault ATA.
+type tokenDetector struct {
+	vaultAddr string
+	ata       string
+	balance   uint64
+}
+
+func (d *tokenDetector) GetBalance(_ context.Context, addr string) (uint64, error) {
+	return 0, nil // SOL balance unused for token payments
+}
+func (d *tokenDetector) SignaturesForAddress(_ context.Context, _ string) ([]string, error) {
+	return nil, nil
+}
+func (d *tokenDetector) GetTokenBalance(_ context.Context, ata string) (uint64, error) {
+	if ata == d.ata {
+		return d.balance, nil
+	}
+	return 0, nil
+}
+
+func TestSPLDepositFlow(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	p := &store.Payment{
+		ID: uuid.Must(uuid.NewV7()).String(), OrderID: "spl_" + uuid.NewString()[:8],
+		AmountBase: 2_500_000, Decimals: 6, Currency: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+		Status:         "pending",
+		Reference:      "E1GaxPQ4xr6PWT2BPY5tLGfLnwsNaNdABqknaGfcC5AF", // valid base58
+		MerchantWallet: testMerchant, WebhookURL: "https://example.com/hook",
+		ExpiresAt: time.Now().Add(30 * time.Minute), CreatedAt: time.Now(),
+	}
+	if err := db.CreatePayment(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	// precompute the ATA the watcher will derive
+	vaultAddr, _ := solana.PublicKeyFromBase58(p.Reference)
+	mint, _ := solana.PublicKeyFromBase58(p.Currency)
+	ata, err := vault.VaultATA(vaultAddr, mint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	swp := newFakeSweeper()
+	det := &tokenDetector{vaultAddr: p.Reference, ata: ata.String(), balance: 2_500_000}
+	w := &Watcher{DB: db, Detector: det, Log: logNop(t), Sweeper: swp,
+		Cfg: WatcherConfig{PollInterval: time.Millisecond, Workers: 2}}
+
+	// tick 1: token balance reached -> SPL sweep + confirmed
+	if err := w.pollOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	row, _ := db.GetPayment(ctx, uuid.MustParse(p.ID))
+	if row.Status != "confirmed" || row.SweepTx == "" {
+		t.Fatalf("after tick1: %+v", row)
+	}
+	swp.mu.Lock()
+	splSwept := false
+	for k := range swp.swept {
+		if len(k) > 4 && k[len(k)-4:] == ":spl" {
+			splSwept = true
+		}
+	}
+	swp.mu.Unlock()
+	if !splSwept {
+		t.Fatal("SPL sweep path not used")
+	}
+
+	// sweep lands -> finalized
+	swp.mu.Lock()
+	swp.state[row.SweepTx] = SweepLanded
+	swp.mu.Unlock()
+	if err := w.pollOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	row, _ = db.GetPayment(ctx, uuid.MustParse(p.ID))
+	if row.Status != "finalized" {
+		t.Fatalf("after tick2: %s", row.Status)
+	}
 }

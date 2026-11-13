@@ -16,8 +16,11 @@ import (
 	"github.com/mufalito/oalgosolana/internal/chain"
 )
 
-// Anchor instruction discriminant: sha256("global:sweep")[0..8].
-var discSweep = anchorSighash("global:sweep")
+// Anchor instruction discriminants.
+var (
+	discSweep    = anchorSighash("global:sweep")
+	discSweepSPL = anchorSighash("global:sweep_spl")
+)
 
 func anchorSighash(name string) []byte {
 	h := sha256.Sum256([]byte(name))
@@ -133,4 +136,56 @@ func (s *Sweeper) SweepState(ctx context.Context, sig string) (string, error) {
 		return "landed", nil
 	}
 	return "pending", nil
+}
+
+// VaultATA derives the vault's associated token account for a mint.
+func VaultATA(vaultAddr, mint solana.PublicKey) (solana.PublicKey, error) {
+	ata, _, err := solana.FindProgramAddress([][]byte{
+		vaultAddr.Bytes(),
+		solana.TokenProgramID.Bytes(),
+		mint.Bytes(),
+	}, solana.SPLAssociatedTokenAccountProgramID)
+	return ata, err
+}
+
+// SweepSPL sends the sweep_spl instruction for an invoice's vault and a
+// mint: the full token balance goes to the merchant's ATA (created if
+// missing, rent paid by the hot wallet), then the vault ATA is closed and
+// its rent returned to the merchant.
+func (s *Sweeper) SweepSPL(ctx context.Context, invoiceID string, mint solana.PublicKey) (string, error) {
+	id, err := InvoiceIDBytes(invoiceID)
+	if err != nil {
+		return "", err
+	}
+	vaultAddr, err := Address(s.Merchant, invoiceID, s.ProgramID)
+	if err != nil {
+		return "", err
+	}
+	vata, err := VaultATA(vaultAddr, mint)
+	if err != nil {
+		return "", err
+	}
+	mata, _, err := solana.FindAssociatedTokenAddress(s.Merchant, mint)
+	if err != nil {
+		return "", err
+	}
+	data := make([]byte, 0, 8+16)
+	data = append(data, discSweepSPL...)
+	data = append(data, id[:]...)
+	ix := solana.NewInstruction(
+		s.ProgramID,
+		solana.AccountMetaSlice{
+			{PublicKey: vaultAddr, IsWritable: false, IsSigner: false},             // vault PDA (seeds-checked, may not exist)
+			{PublicKey: vata, IsWritable: true, IsSigner: false},                   // vault ATA
+			{PublicKey: s.Merchant, IsWritable: true, IsSigner: false},             // merchant (rent destination)
+			{PublicKey: mata, IsWritable: true, IsSigner: false},                   // merchant ATA (init_if_needed)
+			{PublicKey: mint, IsWritable: false, IsSigner: false},                  // mint
+			{PublicKey: s.HotWallet.PublicKey(), IsWritable: true, IsSigner: true}, // payer (ATA rent)
+			{PublicKey: solana.TokenProgramID},
+			{PublicKey: solana.SPLAssociatedTokenAccountProgramID},
+			{PublicKey: solana.SystemProgramID},
+		},
+		data,
+	)
+	return s.sendTx(ctx, ix)
 }

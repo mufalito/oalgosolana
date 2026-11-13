@@ -3,7 +3,10 @@ package watcher
 import (
 	"context"
 
+	"github.com/gagliardetto/solana-go"
+
 	"github.com/mufalito/oalgosolana/internal/store"
+	"github.com/mufalito/oalgosolana/internal/vault"
 )
 
 // SweepState describes what happened to a sent sweep.
@@ -18,6 +21,7 @@ const (
 // DepositSweeper sweeps derived vaults for deposit-address payments.
 type DepositSweeper interface {
 	SweepVault(ctx context.Context, invoiceID string) (string, error)
+	SweepSPL(ctx context.Context, invoiceID string, mint string) (string, error)
 	CheckSweep(ctx context.Context, sig string) (SweepState, error)
 }
 
@@ -33,7 +37,7 @@ type DepositSweeper interface {
 func (w *Watcher) processDeposit(ctx context.Context, p *store.Payment) error {
 	switch p.Status {
 	case "pending", "processing":
-		balance, err := w.Detector.GetBalance(ctx, p.Reference)
+		balance, err := w.vaultBalance(ctx, p)
 		if err != nil {
 			return err
 		}
@@ -72,7 +76,13 @@ func (w *Watcher) sweepDeposit(ctx context.Context, p *store.Payment, incomingSi
 			"payment_id", p.ID, "reference", p.Reference)
 		return nil
 	}
-	sweepSig, err := w.Sweeper.SweepVault(ctx, p.ID)
+	var sweepSig string
+	var err error
+	if p.Currency == "SOL" {
+		sweepSig, err = w.Sweeper.SweepVault(ctx, p.ID)
+	} else {
+		sweepSig, err = w.Sweeper.SweepSPL(ctx, p.ID, p.Currency)
+	}
 	if err != nil {
 		// transient: retried next tick while the payment stays watchable
 		w.Log.Error("sweep send failed", "payment_id", p.ID, "reference", p.Reference, "err", err.Error())
@@ -114,7 +124,7 @@ func (w *Watcher) awaitSweep(ctx context.Context, p *store.Payment) error {
 			"payment_id", p.ID, "reference", p.Reference, "sweep_tx", p.SweepTx)
 		return nil
 	case SweepFailed:
-		balance, err := w.Detector.GetBalance(ctx, p.Reference)
+		balance, err := w.vaultBalance(ctx, p)
 		if err != nil {
 			return err
 		}
@@ -129,11 +139,42 @@ func (w *Watcher) awaitSweep(ctx context.Context, p *store.Payment) error {
 	}
 }
 
+// vaultBalance returns the payment's vault balance in base units: lamports
+// for SOL invoices, token units for mint invoices (0 when the vault ATA does
+// not exist yet).
+func (w *Watcher) vaultBalance(ctx context.Context, p *store.Payment) (uint64, error) {
+	if p.Currency == "SOL" {
+		return w.Detector.GetBalance(ctx, p.Reference)
+	}
+	tokens, ok := w.Detector.(TokenBalanceReader)
+	if !ok {
+		return 0, nil
+	}
+	vaultAddr, err := solana.PublicKeyFromBase58(p.Reference)
+	if err != nil {
+		return 0, err
+	}
+	mint, err := solana.PublicKeyFromBase58(p.Currency)
+	if err != nil {
+		return 0, err
+	}
+	ata, err := vault.VaultATA(vaultAddr, mint)
+	if err != nil {
+		return 0, err
+	}
+	return tokens.GetTokenBalance(ctx, ata.String())
+}
+
+// TokenBalanceReader is the optional token-balance capability of a Detector.
+type TokenBalanceReader interface {
+	GetTokenBalance(ctx context.Context, tokenAccount string) (uint64, error)
+}
+
 // SweepLateDeposit handles any deposit payment whose vault still holds
 // funds — expired, lapsed or otherwise. Money in a vault must always reach
 // the merchant; state bookkeeping follows the money.
 func (w *Watcher) SweepLateDeposit(ctx context.Context, p *store.Payment) error {
-	balance, err := w.Detector.GetBalance(ctx, p.Reference)
+	balance, err := w.vaultBalance(ctx, p)
 	if err != nil || balance == 0 {
 		return err
 	}

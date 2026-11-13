@@ -39,12 +39,11 @@ type Service struct {
 	Cfg   *config.Config
 	Log   *slog.Logger
 	// OnCreated is an optional metrics hook.
-	OnCreated func(currency string)
-	// DepositProgramID identifies the vault program; DepositRentMinimum is
-	// read from RPC (rent changes with protocol upgrades) — the first
-	// transfer to a fresh vault address must cover it.
+	OnCreated          func(currency string)
 	DepositProgramID   solana.PublicKey
 	DepositRentMinimum func(ctx context.Context) uint64
+	// MintDecimals fetches an SPL mint's decimals (nil = SOL-only).
+	MintDecimals func(ctx context.Context, mint string) (uint8, error)
 }
 
 // Created is the response payload of payment creation.
@@ -79,8 +78,26 @@ type Get struct {
 // Create validates input, derives the vault address, persists, and returns
 // the payment URL and QR code. No on-chain transaction is made.
 func (s *Service) Create(ctx context.Context, req CreateRequest) (*Created, error) {
+	currency := "SOL"
+	decimals := solanapay.SOLDecimals
+	mint := ""
 	if req.Currency != "" && req.Currency != "SOL" {
-		return nil, apierr.Errorf(400, apierr.CodeInvalidCurrency, "only SOL is supported")
+		if _, err := solana.PublicKeyFromBase58(req.Currency); err != nil {
+			return nil, apierr.Errorf(400, apierr.CodeInvalidCurrency, "currency must be SOL or a base58 mint address")
+		}
+		if !s.Cfg.AcceptsMint(req.Currency) {
+			return nil, apierr.Errorf(400, apierr.CodeInvalidCurrency, "mint not accepted by this gateway")
+		}
+		if s.MintDecimals == nil {
+			return nil, apierr.Errorf(500, apierr.CodeInternal, "token support not configured")
+		}
+		d, err := s.MintDecimals(ctx, req.Currency)
+		if err != nil {
+			return nil, apierr.Errorf(400, apierr.CodeInvalidCurrency, "unknown or non-mint account")
+		}
+		mint = req.Currency
+		currency = req.Currency
+		decimals = int(d)
 	}
 	if req.OrderID == "" {
 		return nil, apierr.Errorf(400, apierr.CodeInvalidRequest, "order_id is required")
@@ -99,17 +116,19 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Created, erro
 		}
 		expirationMin = req.ExpirationMin
 	}
-	amountBase, err := solanapay.ParseAmount(req.Amount)
+	amountBase, err := solanapay.ParseAmount(req.Amount, decimals)
 	if err != nil {
 		return nil, apierr.Errorf(400, apierr.CodeInvalidAmount, "amount: %v", err)
 	}
-	// A vault address is created by the customer's first transfer, which
-	// must leave the new account rent-exempt — the invoice has to allow it.
-	if s.DepositRentMinimum != nil {
+	// A SOL vault address is created by the customer's first transfer,
+	// which must leave the new account rent-exempt — the invoice has to
+	// allow it. Token vaults need no SOL minimum (the payer's wallet also
+	// creates the vault's token account).
+	if mint == "" && s.DepositRentMinimum != nil {
 		if min := s.DepositRentMinimum(ctx); amountBase < min {
 			return nil, apierr.Errorf(400, apierr.CodeInvalidAmount,
 				"amount must be at least %s SOL (rent-exempt minimum read from RPC)",
-				solanapay.FormatAmount(min))
+				solanapay.FormatAmount(min, solanapay.SOLDecimals))
 		}
 	}
 
@@ -127,7 +146,8 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Created, erro
 		ID:             id.String(),
 		OrderID:        req.OrderID,
 		AmountBase:     amountBase,
-		Currency:       "SOL",
+		Decimals:       decimals,
+		Currency:       currency,
 		Status:         "pending",
 		Reference:      addr.String(), // vault address
 		MerchantWallet: s.Cfg.MerchantWallet.String(),
@@ -143,13 +163,13 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Created, erro
 		}
 		return nil, apierr.Errorf(500, apierr.CodeInternal, "persist payment")
 	}
-	payURL := solanapay.BuildURL(addr.String(), req.Label, req.Message, amountBase)
+	payURL := solanapay.BuildURL(addr.String(), req.Label, req.Message, amountBase, decimals, mint)
 	qr, err := solanapay.QRCodePNG(payURL)
 	if err != nil {
 		return nil, apierr.Errorf(500, apierr.CodeInternal, "encode QR")
 	}
 	if s.OnCreated != nil {
-		s.OnCreated("SOL")
+		s.OnCreated(currency)
 	}
 	s.Log.InfoContext(ctx, "payment_created",
 		"payment_id", p.ID, "reference", p.Reference, "order_id", p.OrderID,
@@ -157,9 +177,9 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Created, erro
 	return &Created{
 		PaymentID:      p.ID,
 		OrderID:        p.OrderID,
-		Amount:         solanapay.FormatAmount(amountBase),
+		Amount:         solanapay.FormatAmount(amountBase, decimals),
 		AmountBase:     uitoa(amountBase),
-		Currency:       "SOL",
+		Currency:       currency,
 		SolanaPayURL:   payURL,
 		QRCode:         base64.StdEncoding.EncodeToString(qr),
 		DepositAddress: addr.String(),
@@ -184,7 +204,7 @@ func (s *Service) GetByID(ctx context.Context, id string) (*Get, error) {
 	g := &Get{
 		PaymentID:      p.ID,
 		OrderID:        p.OrderID,
-		Amount:         solanapay.FormatAmount(p.AmountBase),
+		Amount:         solanapay.FormatAmount(p.AmountBase, p.Decimals),
 		AmountBase:     uitoa(p.AmountBase),
 		Currency:       p.Currency,
 		Status:         p.Status,
