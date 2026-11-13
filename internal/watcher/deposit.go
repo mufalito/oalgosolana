@@ -21,12 +21,6 @@ type DepositSweeper interface {
 	CheckSweep(ctx context.Context, sig string) (SweepState, error)
 }
 
-// DepositBalanceReader is the balance capability the detector must provide
-// in deposit mode.
-type DepositBalanceReader interface {
-	GetBalance(ctx context.Context, address string) (uint64, error)
-}
-
 // processDeposit drives deposit-address payments using BALANCES, not
 // signature history:
 //
@@ -37,14 +31,9 @@ type DepositBalanceReader interface {
 //	  LANDED (finalized, err==nil); a failed/dropped sweep is re-sent on a
 //	  later tick until the vault is empty.
 func (w *Watcher) processDeposit(ctx context.Context, p *store.Payment) error {
-	balancer, ok := w.Detector.(DepositBalanceReader)
-	if !ok {
-		return nil
-	}
-
 	switch p.Status {
 	case "pending", "processing":
-		balance, err := balancer.GetBalance(ctx, p.Reference)
+		balance, err := w.Detector.GetBalance(ctx, p.Reference)
 		if err != nil {
 			return err
 		}
@@ -57,7 +46,7 @@ func (w *Watcher) processDeposit(ctx context.Context, p *store.Payment) error {
 				if err := w.DB.MarkProcessing(ctx, p.ID, ""); err != nil {
 					return err
 				}
-				w.transition("pending", "processing", "")
+				w.transition("pending", "processing")
 			}
 			return nil
 		}
@@ -92,7 +81,7 @@ func (w *Watcher) sweepDeposit(ctx context.Context, p *store.Payment, incomingSi
 	if err := w.DB.ConfirmDeposit(ctx, p.ID, incomingSig, sweepSig, w.now()); err != nil {
 		return err
 	}
-	w.transition("processing", "confirmed", "")
+	w.transition("processing", "confirmed")
 	if err := w.DB.EnqueueWebhook(ctx, p.ID, "payment.confirmed"); err != nil {
 		return err
 	}
@@ -117,7 +106,7 @@ func (w *Watcher) awaitSweep(ctx context.Context, p *store.Payment) error {
 		if err := w.DB.FinalizePayment(ctx, p.ID, w.now()); err != nil {
 			return err
 		}
-		w.transition("confirmed", "finalized", "")
+		w.transition("confirmed", "finalized")
 		if err := w.DB.EnqueueWebhook(ctx, p.ID, "payment.finalized"); err != nil {
 			return err
 		}
@@ -125,11 +114,7 @@ func (w *Watcher) awaitSweep(ctx context.Context, p *store.Payment) error {
 			"payment_id", p.ID, "reference", p.Reference, "sweep_tx", p.SweepTx)
 		return nil
 	case SweepFailed:
-		balancer, ok := w.Detector.(DepositBalanceReader)
-		if !ok {
-			return nil
-		}
-		balance, err := balancer.GetBalance(ctx, p.Reference)
+		balance, err := w.Detector.GetBalance(ctx, p.Reference)
 		if err != nil {
 			return err
 		}
@@ -148,11 +133,7 @@ func (w *Watcher) awaitSweep(ctx context.Context, p *store.Payment) error {
 // funds — expired, lapsed or otherwise. Money in a vault must always reach
 // the merchant; state bookkeeping follows the money.
 func (w *Watcher) SweepLateDeposit(ctx context.Context, p *store.Payment) error {
-	balancer, ok := w.Detector.(DepositBalanceReader)
-	if !ok {
-		return nil
-	}
-	balance, err := balancer.GetBalance(ctx, p.Reference)
+	balance, err := w.Detector.GetBalance(ctx, p.Reference)
 	if err != nil || balance == 0 {
 		return err
 	}

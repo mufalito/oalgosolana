@@ -4,11 +4,13 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/mufalito/oalgosolana/internal/chain"
 	"github.com/mufalito/oalgosolana/internal/store"
 )
@@ -45,6 +47,8 @@ func (f *fakeVaultSweeper) CheckSweep(_ context.Context, sig string) (SweepState
 	return f.state[sig], nil
 }
 
+const testMerchant = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"
+
 var errBoom = boom{}
 
 type boom struct{}
@@ -67,7 +71,6 @@ func itoa(n int) string {
 
 // depositDetector serves balances and one incoming signature.
 type depositDetector struct {
-	fakeDetector
 	vaultAddr string
 	balance   uint64
 }
@@ -90,10 +93,7 @@ func newDepositWatcher(db *store.Store, det chain.Detector, swp *fakeVaultSweepe
 	return &Watcher{
 		DB: db, Detector: det, Log: slog.New(slog.NewTextHandler(os.Stderr, nil)),
 		Sweeper: swp,
-		Cfg: WatcherConfig{
-			ConfirmationPolicy: "confirmed", PollInterval: time.Millisecond,
-			Workers: 2, DepositMode: true,
-		},
+		Cfg:     WatcherConfig{PollInterval: time.Millisecond, Workers: 2},
 	}
 }
 
@@ -260,4 +260,39 @@ func TestSweepLateDepositExpired(t *testing.T) {
 	if attempts != 1 {
 		t.Fatalf("late deposit must sweep, attempts=%d", attempts)
 	}
+}
+
+// testURL gives this package its own database so parallel test packages never
+// truncate each other's rows.
+func testURL(t *testing.T) string {
+	t.Helper()
+	base := os.Getenv("TEST_DATABASE_URL")
+	if base == "" {
+		base = "postgres://solanapay:solanapay@localhost:5432/postgres?sslmode=disable"
+	}
+	name := "solanapay_test_watcher"
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, err := pgx.Connect(ctx, base)
+	if err != nil {
+		t.Skipf("database not reachable: %v", err)
+	}
+	defer c.Close(context.Background())
+	_, _ = c.Exec(ctx, "CREATE DATABASE "+name)
+	return strings.Replace(base, "/postgres?", "/"+name+"?", 1)
+}
+
+func testDB(t *testing.T) *store.Store {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	st, err := store.Open(ctx, testURL(t))
+	if err != nil {
+		t.Skipf("database not reachable: %v", err)
+	}
+	t.Cleanup(st.Close)
+	if _, err := st.Pool.Exec(ctx, `TRUNCATE webhook_deliveries, payments`); err != nil {
+		t.Fatal(err)
+	}
+	return st
 }

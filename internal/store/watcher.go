@@ -30,8 +30,6 @@ func (s *Store) WithTx(ctx context.Context, fn func(q Querier) error) error {
 	return tx.Commit(ctx)
 }
 
-// ClaimSignature inserts a (payment_id, tx_signature) idempotency row and
-// reports whether this call was the first to claim it.
 func (s *Store) ClaimSignature(ctx context.Context, paymentID, sig string) (bool, error) {
 	tag, err := s.Pool.Exec(ctx,
 		`INSERT INTO payment_txs (payment_id, tx_signature) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
@@ -42,7 +40,6 @@ func (s *Store) ClaimSignature(ctx context.Context, paymentID, sig string) (bool
 	return tag.RowsAffected() == 1, nil
 }
 
-// HasPaymentTx reports whether the signature was already recorded.
 func (s *Store) HasPaymentTx(ctx context.Context, paymentID, sig string) (bool, error) {
 	var exists bool
 	err := s.Pool.QueryRow(ctx,
@@ -59,7 +56,6 @@ func (s *Store) MarkProcessing(ctx context.Context, paymentID, sig string) error
 	return err
 }
 
-// ConfirmPayment sets status confirmed and records the signature + time.
 func (s *Store) ConfirmPayment(ctx context.Context, paymentID, sig string, at time.Time) error {
 	_, err := s.Pool.Exec(ctx,
 		`UPDATE payments SET status='confirmed', tx_signature=$2, confirmed_at=$3,
@@ -76,7 +72,6 @@ func (s *Store) FinalizePayment(ctx context.Context, paymentID string, at time.T
 	return err
 }
 
-// FailPayment marks a payment failed with an exact reason code.
 func (s *Store) FailPayment(ctx context.Context, paymentID, reason string, at time.Time) error {
 	_, err := s.Pool.Exec(ctx,
 		`UPDATE payments SET status='failed', failure_reason=$2 WHERE id=$1 AND status IN ('pending','processing','confirmed')`,

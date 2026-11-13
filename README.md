@@ -1,16 +1,117 @@
 # oalgosolana — Solana Pay Gateway
 
-Self-hosted Solana payment gateway with three payment modes:
+Self-hosted Solana payment gateway built around an **on-chain vault program**:
+every invoice gets a unique derived deposit address payable from any wallet
+or exchange — plain address + amount, no Solana Pay support, no reference,
+no memo — and funds can only ever leave a vault to the merchant's wallet,
+enforced on-chain.
 
-| Mode | Customer needs | Custody |
-|---|---|---|
-| Reference (default) | Solana Pay-capable wallet (`solana:` link / QR) | none — funds go straight to your wallet |
-| Deposit vault | any wallet/exchange, plain address + amount | constrained — funds can only leave to your cold wallet, enforced on-chain |
+**Status: prototype.** Core flow is live-tested on Solana devnet; the vault
+program is unaudited. Read [vault-program/README.md](vault-program/README.md)
+before putting real money behind it.
 
-**Status: prototype.** Core flows are live-tested on Solana devnet (see
-[Verification](#operations)); the vault program is unaudited. Read
-[vault-program/README.md](vault-program/README.md) before putting real money
-behind it.
+## How it works
+
+1. `POST /api/v1/payments` → the deposit address is the vault PDA derived
+   from `["vault", merchant, invoice_id]`. **Nothing is created on-chain**:
+   no transaction, no keys, no rent — unpaid invoices cost zero.
+2. The customer pays the address from any wallet or exchange. Their own
+   transfer creates the vault (and pays its rent).
+3. The watcher sees the balance reach the invoiced amount and sends the
+   `sweep` instruction (fee paid by the gateway hot wallet). The program
+   moves the **entire balance** to the merchant embedded in the seeds and
+   the account closes — a sweep naming any other destination derives a
+   different address and is rejected on-chain (`ConstraintSeeds`).
+4. The confirmed sweep is the receipt: `payment.confirmed` webhook, then
+   `payment.finalized` when the sweep finalizes.
+
+The destination is baked into the address derivation, not passed as an
+argument — the gateway's hot wallet can pay fees and *ask* for sweeps, but
+cannot redirect or steal funds.
+
+## Security model
+
+- A full server compromise can: hand customers different addresses for NEW
+  invoices (detectable — the merchant can recompute every valid address
+  offline), delay sweeps (DoS), and burn hot-wallet fees. It cannot redirect
+  or steal money already paid into any vault.
+- The one real kill switch is the **program upgrade authority**: compromise
+  it and all vaults can be drained. Revoke it after deployment
+  (`solana program set-upgrade-authority --final`) or multisig it.
+- No audit. Prototype code.
+
+## API
+
+Spec: [`api/openapi.yaml`](api/openapi.yaml) (source of truth). All
+endpoints except `/healthz`, `/readyz`, `/metrics` require
+`Authorization: Bearer <key>` (constant-time compared, per-key token-bucket
+rate limiting). Errors are `{"error":{"code":"...","message":"..."}}`.
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/v1/payments` | Create invoice (SOL; amount as decimal string) |
+| `GET /api/v1/payments/{id}` | Status incl. sweep/payment signatures |
+| `POST /api/v1/payments/{id}/webhook/replay` | Requeue dead/pending deliveries |
+| `GET /healthz` `/readyz` `/metrics` | Liveness, readiness (DB+RPC), Prometheus |
+
+Amounts: decimal strings at the API edge only; stored and compared as
+`uint64` lamports. Minimum invoice = the rent-exempt minimum for an empty
+account, read live from RPC (the customer's transfer must be able to create
+the vault).
+
+## Payment lifecycle
+
+```
+pending → processing → confirmed → finalized
+   │          │             └─ sweep lands on-chain (receipt)
+   │          └─ partial funds seen, amount not yet reached
+   └─ expires_at passed → expired
+```
+
+- **Underpayment** accumulates: the invoice stays `processing` until the
+  vault holds the full amount; more transfers add up.
+- **Overpayment / rent**: the sweep takes everything; the merchant receives
+  the excess and the account rent. Reconcile manually.
+- **Late payment** (after expiry): the reaper detects vault balance > 0 and
+  sweeps anyway — money in a vault always reaches the merchant.
+- **Failed/dropped sweep**: re-sent on the next tick while the vault holds
+  funds; `finalized` only after a sweep has actually landed (`err == nil`,
+  finalized commitment).
+- Anyone can call `sweep` — safe by construction; lets the merchant run an
+  independent sweeper as a checkpoint on the gateway.
+
+## Webhooks
+
+Events: `payment.confirmed`, `payment.finalized`, `payment.expired` (only
+when a `webhook_url` is set — per payment, https-only).
+
+Headers: `X-Signature-256: sha256=<hex>` = HMAC-SHA256 over
+`X-Webhook-Timestamp + "." + raw_body` with `WEBHOOK_SECRET`; verify with a
+constant-time comparison and reject skew > 5 min (see
+`examples/frontend.js` for a Node receiver). At-least-once delivery,
+exponential backoff with jitter capped at 10 min, dead-letter after
+`WEBHOOK_MAX_ATTEMPTS`, requeueable via the replay endpoint.
+
+## Configuration
+
+All configuration is environment variables; see [.env.example](.env.example).
+Required: `API_KEYS`, `MERCHANT_WALLET` (the cold wallet), `RPC_URL`
+(own node or paid provider — never public mainnet RPC), `WEBHOOK_SECRET`
+(≥32 bytes), `DATABASE_URL`, `DEPOSIT_PROGRAM_ID`, `GATEWAY_HOT_WALLET`
+(sweep fees only).
+
+## Operations
+
+- Graceful shutdown: SIGTERM → HTTP drain (30 s) → watcher/webhook/reaper
+  cancel → pool close.
+- Metrics (`/metrics`): `payments_created_total{currency}`,
+  `payments_confirmed_total`, `payments_expired_total`,
+  `webhook_attempts_total{result}`, `webhook_delivery_seconds`,
+  `rpc_request_seconds{method}`, `rpc_errors_total{method}`.
+- Readiness (`/readyz`): `SELECT 1` + RPC `getHealth`, 2 s budget each.
+- Watcher runs one instance per database (poll is idempotent but not
+  row-locked across RPC calls). Webhook delivery claims are
+  `FOR UPDATE SKIP LOCKED` (replica-safe).
 
 ## Repository layout
 
@@ -20,158 +121,19 @@ internal/
   api/             chi handlers, middleware, error envelope
   apierr/          machine-readable error codes (leaf package)
   payment/         payment domain service (creation, lookup)
-  solanapay/       PURE: amounts, URLs, references, QR — no I/O
-  chain/           RPC detector + strict on-chain validation
-  watcher/         state machine (pending→processing→confirmed→finalized)
+  solanapay/       PURE: amounts, URLs, QR — no I/O
+  chain/           RPC client (balances, signatures, statuses, rent)
+  watcher/         state machine (balance trigger → sweep → finality)
   webhook/         HMAC-signed deliveries, retries, dead-letter
-  reaper/          expiry + late-fund detection
+  reaper/          expiry + late-fund sweeping
   vault/           client for the on-chain vault program
-  wallet/          AES-256-GCM secret encryption at rest
   store/           pgx repositories + embedded goose migrations
   config/ metrics/
 api/openapi.yaml   API spec (source of truth)
 migrations/        SQL migrations (embedded in the binary)
-vault-program/     Anchor (otter-sec fork) deposit-vault program
+vault-program/     Anchor vault program (derived vaults, sweep-only)
 examples/          curl + JS integration snippets
 ```
- Create payments, hand
-customers a native Solana Pay URL + QR code, watch the chain, and receive
-signed webhooks when payments confirm and finalize.
-
-The gateway holds **zero private keys** and exposes **no fund-moving
-endpoints**. Funds move directly from the customer's wallet to the merchant
-wallet configured in server environment variables.
-
-## Security model — the precise claim
-
-> A full server compromise cannot redirect funds already received.
-> Redirecting *future* payments would require changing the merchant wallet in
-> server configuration, which is not settable through the public API and is
-> outside the API's trust boundary (audit your env/config management).
-
-Consequences:
-- The API process never signs transactions and cannot move money, ever.
-- Amounts are locked at creation; the watcher only *validates* on-chain
-  transfers (recipient, mint, amount, reference) — it accepts a payment only
-  if the on-chain transfer exactly matches.
-- Webhooks are HMAC-SHA256 signed; receivers verify `X-Signature-256` over
-  `timestamp + "." + raw_body` and reject timestamps skewed > 5 minutes.
-
-## Quick start
-
-```sh
-cp .env.example .env        # then edit: API_KEYS, MERCHANT_WALLET, RPC_URL,
-                            # WEBHOOK_SECRET, USDC_MINT_DEVNET (for devnet USDC)
-docker compose up --build
-curl -s localhost:8080/healthz   # {"status":"ok"}
-```
-
-Postgres runs in compose; migrations apply automatically on startup (embedded
-goose). Create a payment (see `examples/create-payment.sh`):
-
-```sh
-curl -X POST localhost:8080/api/v1/payments \
-  -H "Authorization: Bearer $API_KEY" -H 'Content-Type: application/json' \
-  -d '{"amount":"1.50","currency":"SOL","order_id":"o1"}'
-```
-
-The response contains `solana_pay_url` (`solana:...`), a base64 PNG `qr_code`,
-and the `reference` pubkey. Pay with any Solana Pay wallet, then poll
-`GET /api/v1/payments/{id}` — the watcher moves it
-`pending → processing → confirmed → finalized` and fires webhooks.
-
-### Devnet smoke test
-
-1. `CLUSTER=devnet`, `RPC_URL=https://api.devnet.solana.com` (or your own).
-2. Set `MERCHANT_WALLET` to a wallet you control.
-3. Create a payment, open the `solana:` URL in a devnet-enabled wallet
-   (e.g. Phantom on devnet), send the exact amount.
-4. Watch `GET /api/v1/payments/{id}` flip to `confirmed` (~seconds) and
-   `finalized` (~15–30 s), or check `payments_confirmed_total` on `/metrics`.
-
-## API
-
-Full spec: [`api/openapi.yaml`](api/openapi.yaml) (source of truth).
-All endpoints except `/healthz`, `/readyz`, `/metrics` require
-`Authorization: Bearer <key>` (keys from `API_KEYS`, constant-time compared,
-token-bucket rate limited per key). Errors are always
-`{"error":{"code":"...","message":"..."}}`.
-
-| Endpoint | Purpose |
-|---|---|
-| `POST /api/v1/payments` | Create payment (amount decimal string, SOL/USDC) |
-| `GET /api/v1/payments/{id}` | Status incl. `tx_signature`, webhook statuses |
-| `POST /api/v1/payments/{id}/webhook/replay` | Requeue dead/pending deliveries |
-| `GET /healthz` `/readyz` `/metrics` | Liveness, readiness (DB+RPC), Prometheus |
-
-Amounts: decimal strings at the API edge only (`"1.50"`); stored and compared
-as `uint64` base units (SOL 9 decimals, USDC 6). More fractional digits than
-the currency allows → `400 INVALID_AMOUNT`. Never `float64`.
-
-## Payment lifecycle
-
-```
-pending → processing → confirmed → finalized
-   │          │            └─ escalation pass at finalized commitment
-   │          └─ validation failure → failed (WRONG_RECIPIENT | WRONG_MINT |
-   │                                    WRONG_AMOUNT | MISSING_REFERENCE)
-   └─ expires_at passed → expired (late valid tx recorded in detected_tx,
-                                    never auto-confirmed)
-```
-
-- Idempotency: unique `(payment_id, tx_signature)`; re-processing the same tx
-  never changes state or re-fires webhooks. Webhook queue has unique
-  `(payment_id, event_type)` — at-least-once delivery, consumers must
-  tolerate duplicates.
-- Webhook delivery claims use `FOR UPDATE SKIP LOCKED` (replica-safe). The
-  payment poll is idempotent by candidate-claim but NOT row-locked across
-  its RPC calls: run one watcher per database.
-- Confirmation policy (`CONFIRMATION_POLICY=confirmed|finalized`):
-  `confirmed` fires the webhook at ~2 s and escalates to a `payment.finalized`
-  event at finality; `finalized` fires once, only at finality.
-
-## Webhooks
-
-Events: `payment.confirmed`, `payment.finalized`, `payment.expired` (only when
-a `webhook_url` is set — per payment, https-only).
-
-Headers: `X-Signature-256: sha256=<hex>` = HMAC-SHA256 over
-`X-Webhook-Timestamp + "." + raw_body` with `WEBHOOK_SECRET`;
-verify with a constant-time comparison and reject skew > 5 min (see
-`examples/frontend.js` for a Node receiver).
-
-Retries: exponential backoff `2^attempt s × (0.5 + jitter)`, capped at 10 min,
-up to `WEBHOOK_MAX_ATTEMPTS` (8), then dead-letter — surfaced in the GET
-payment response (`"webhook":{"payment.confirmed":"dead"}`) and requeueable
-via the replay endpoint.
-
-## Configuration
-
-All configuration is environment variables; see [.env.example](.env.example).
-Notable:
-
-- `MERCHANT_WALLET` — base58; funds destination; server config only.
-- `RPC_URL` — required; use your own node or a paid provider. Never public
-  mainnet RPC in production.
-- `USDC_MINT_MAINNET` defaults to the Circle mainnet mint
-  (`EPjFW...Dt1v`). `USDC_MINT_DEVNET` must be supplied by the operator
-  (verify the current Circle devnet mint) — USDC payments on devnet without
-  it are rejected with `INVALID_CURRENCY`.
-
-## Operations
-
-- Graceful shutdown: SIGTERM → HTTP drain (30 s) → watcher/webhook/reaper
-  workers cancel → pool close.
-- Metrics (`/metrics`): `payments_created_total{currency}`,
-  `payments_confirmed_total`, `payments_failed_total{reason}`,
-  `payments_expired_total`, `webhook_attempts_total{result}`,
-  `webhook_delivery_seconds`, `rpc_request_seconds{method}`,
-  `rpc_errors_total{method}`.
-- Readiness (`/readyz`): `SELECT 1` + RPC `getHealth`, 2 s budget each.
-- The poll strategy is O(pending references) behind the
-  `chain.Detector` interface — swap in websockets/block-subscription later
-  without touching validation logic.
-- Watchdog limits: `POLL_INTERVAL`, `WORKER_COUNT`, per-RPC rate limiter.
 
 ## Development
 
@@ -179,46 +141,12 @@ Notable:
 go build ./... && go vet ./... && go test ./...
 ```
 
-Unit tests (amount parsing, URL/QR, validation, state machine, HMAC, backoff)
-run everywhere; watcher/webhook tests need a local Postgres (skipped when
-unreachable). End-to-end tests against `solana-test-validator` run when
-`SOLANA_TEST_VALIDATOR_URL` is set (or a validator is on localhost:8899).
-
-## Optional deposit-address mode (vault program)
-
-`DEPOSIT_ADDRESS_MODE=true` + `DEPOSIT_PROGRAM_ID` + `GATEWAY_HOT_WALLET`:
-every invoice's deposit address is the vault PDA derived from
-`["vault", merchant, invoice_id]` — **nothing is created on-chain at invoice
-time** (zero cost for unpaid invoices; no create transaction that could
-fail or be front-run). The customer's own transfer creates the vault and
-pays its rent; the `sweep` instruction moves the **entire balance** to the
-merchant embedded in the seeds, closing the account — a sweep naming any
-other destination derives a different address and is rejected on-chain
-(`ConstraintSeeds`, verified live on devnet). The gateway's hot wallet pays
-sweep fees only; it cannot redirect funds. A full server compromise can
-hand customers different addresses for NEW invoices (the merchant can
-independently recompute every address to detect this) and delay sweeps, but
-cannot redirect or steal money already paid in. Minimum invoice in this mode
-is the rent-exempt minimum for an empty account, read live from RPC.
-Guard the program's upgrade authority — revoke it
-(`solana program set-upgrade-authority --final`) or multisig it.
-
-Customers pay a plain address + amount from any wallet or exchange — no
-Solana Pay support, no reference, no memo. Detection is balance-based: when
-the vault holds the invoiced amount, the gateway sweeps and treats the
-confirmed sweep as the receipt; failed or dropped sweeps are re-sent. Funds
-arriving late (expired invoice) are detected by balance and swept too —
-money in a vault always reaches the merchant. SOL only; USDC remains
-reference-mode only. In this mode the non-custodial compromise-safety claim
-applies to reference mode only — deposit mode is custody-constrained
-(destination fixed on-chain), not key-free.
-
-Per-invoice matching semantics in deposit mode: attribution is by unique
-address; payments are confirmed once received lamports ≥ invoice amount
-(overpayments and multiple partial transfers accumulate). `reference` in API
-responses equals the deposit address.
+Unit tests (amount parsing, URL/QR, state machine, HMAC, backoff) run
+everywhere; watcher/webhook tests need a local Postgres (skipped when
+unreachable, isolated per-package databases).
 
 ## Out of scope (by design)
 
-Reference-mode only: multi-merchant support, dashboards, fee collection. Refunds/withdrawals (merchants sign payouts from their own wallet),
-multi-merchant support, dashboards, fee collection.
+Multi-merchant support, dashboards, fee collection, refunds/withdrawals
+(merchants sign payouts from their own wallet), USDC/tokens (needs
+pre-created token accounts; revisit with an audited program).

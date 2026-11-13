@@ -75,15 +75,13 @@ func main() {
 
 	paySvc := &payment.Service{Store: st, Cfg: cfg, Log: log}
 	paySvc.OnCreated = func(currency string) { metrics.PaymentsCreated.WithLabelValues(currency).Inc() }
-	if cfg.DepositAddressMode {
-		programID, err := solana.PublicKeyFromBase58(cfg.DepositProgramID)
-		if err != nil {
-			log.Error("invalid DEPOSIT_PROGRAM_ID")
-			os.Exit(1)
-		}
-		paySvc.DepositProgramID = programID
-		paySvc.DepositRentMinimum = detector.RentExemptMinimum
+	programID, err := solana.PublicKeyFromBase58(cfg.DepositProgramID)
+	if err != nil {
+		log.Error("invalid DEPOSIT_PROGRAM_ID")
+		os.Exit(1)
 	}
+	paySvc.DepositProgramID = programID
+	paySvc.DepositRentMinimum = detector.RentExemptMinimum
 
 	replayer := func(ctx context.Context, paymentID string) error {
 		found, err := st.ReplayDelivery(ctx, paymentID)
@@ -113,36 +111,26 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	var depositSweeper watcher.DepositSweeper
-	if cfg.DepositAddressMode {
-		hw, err := solana.PrivateKeyFromSolanaKeygenFile(cfg.GatewayHotWallet)
-		if err != nil {
-			log.Error("load GATEWAY_HOT_WALLET", "err", err.Error())
-			os.Exit(1)
-		}
-		programID, _ := solana.PublicKeyFromBase58(cfg.DepositProgramID)
-		vs := &vault.Sweeper{
-			RPC: detector, ProgramID: programID, Merchant: cfg.MerchantWallet, HotWallet: hw,
-		}
-		depositSweeper = &vaultAdapter{S: vs}
+	hw, err := solana.PrivateKeyFromSolanaKeygenFile(cfg.GatewayHotWallet)
+	if err != nil {
+		log.Error("load GATEWAY_HOT_WALLET", "err", err.Error())
+		os.Exit(1)
 	}
+	vs := &vault.Sweeper{
+		RPC: detector, ProgramID: programID, Merchant: cfg.MerchantWallet, HotWallet: hw,
+	}
+	depositSweeper := watcher.DepositSweeper(&vaultAdapter{S: vs})
 
 	w := &watcher.Watcher{
 		DB: st, Detector: detector, Log: log,
 		Sweeper: depositSweeper,
 		Cfg: watcher.WatcherConfig{
-			ConfirmationPolicy: cfg.ConfirmationPolicy,
-			USDCMint:           cfg.USDCMint(),
-			PollInterval:       cfg.PollInterval,
-			Workers:            cfg.WorkerCount,
-			DepositMode:        cfg.DepositAddressMode,
+			PollInterval: cfg.PollInterval,
+			Workers:      cfg.WorkerCount,
 		},
-		OnTransition: func(from, to, reason string) {
-			switch to {
-			case "confirmed":
+		OnTransition: func(from, to string) {
+			if to == "confirmed" {
 				metrics.PaymentsConfirmed.Inc()
-			case "failed":
-				metrics.PaymentsFailed.WithLabelValues(reason).Inc()
 			}
 		},
 	}
@@ -157,7 +145,7 @@ func main() {
 	}
 
 	rep := &reaper.Reaper{
-		DB: st, Detector: detector, USDCMint: cfg.USDCMint(), Log: log,
+		DB: st, Log: log,
 		Interval:  10 * time.Second,
 		OnExpired: func(n int) { metrics.PaymentsExpired.Add(float64(n)) },
 	}
@@ -167,7 +155,7 @@ func main() {
 	g.Go(func() error { return delivery.Run(gctx) })
 	g.Go(func() error { return rep.Run(gctx) })
 	g.Go(func() error {
-		log.Info("listening", "addr", srv.Addr, "cluster", cfg.Cluster)
+		log.Info("listening", "addr", srv.Addr)
 		err := srv.ListenAndServe()
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil

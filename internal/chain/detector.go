@@ -1,31 +1,13 @@
 package chain
 
-import (
-	"context"
-	"time"
-)
+import "context"
 
-// TxInfo is the normalized view of a transaction the validator needs.
-// Deltas are per-recipient (the merchant wallet) balance changes.
-type TxInfo struct {
-	Signature              string
-	RecipientDeltaLamports uint64            // SOL paid to recipient
-	TokenDeltas            map[string]uint64 // mint -> units paid to recipient
-	AccountKeys            []string          // all account pubkeys in the tx
-}
-
-// Detector abstracts the on-chain poll strategy (per-reference
-// getSignaturesForAddress today; websockets or wallet-scanning later).
+// Detector is the on-chain surface the watcher needs in vault mode:
+// vault balances (trigger) and address signatures (receipt).
 type Detector interface {
-	// SignaturesForAddress returns candidate signatures touching ref.
-	SignaturesForAddress(ctx context.Context, ref string) ([]string, error)
-	// Transaction returns the parsed transaction or an error (incl. not found).
-	// commitment is "confirmed" or "finalized".
-	Transaction(ctx context.Context, signature, recipient, commitment string) (*TxInfo, error)
+	// GetBalance returns the lamports balance of an address.
+	GetBalance(ctx context.Context, address string) (uint64, error)
+	// SignaturesForAddress returns recent successful signatures touching
+	// an address (used to record the customer's payment as the receipt).
+	SignaturesForAddress(ctx context.Context, address string) ([]string, error)
 }
-
-// Clock allows tests to freeze time.
-type Clock func() time.Time
-
-// RealClock is the production clock.
-func RealClock() Clock { return func() time.Time { return time.Now().UTC() } }

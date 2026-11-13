@@ -42,15 +42,6 @@ type Config struct {
 	GatewayHotWallet string `env:"GATEWAY_HOT_WALLET"`
 }
 
-// USDCMint returns the configured USDC mint for the cluster, or "" when not
-// configured (devnet requires the operator to supply it).
-func (c *Config) USDCMint() string {
-	if c.Cluster == "mainnet" {
-		return c.USDCMintMainnet
-	}
-	return c.USDCMintDevnet
-}
-
 // Load parses the environment and validates invariants. It returns an error
 // listing every violated requirement.
 func Load() (*Config, error) {
@@ -76,9 +67,6 @@ func Load() (*Config, error) {
 	if cfg.MerchantWalletRaw != "" {
 		cfg.MerchantWallet = wallet
 	}
-	if cfg.Cluster != "mainnet" && cfg.Cluster != "devnet" {
-		errs = append(errs, "CLUSTER: must be \"mainnet\" or \"devnet\"")
-	}
 	if cfg.RPCURL == "" {
 		errs = append(errs, "RPC_URL: required (never rely on a public mainnet RPC)")
 	}
@@ -87,9 +75,6 @@ func Load() (*Config, error) {
 	}
 	if cfg.DatabaseURL == "" {
 		errs = append(errs, "DATABASE_URL: required")
-	}
-	if cfg.ConfirmationPolicy != "confirmed" && cfg.ConfirmationPolicy != "finalized" {
-		errs = append(errs, "CONFIRMATION_POLICY: must be \"confirmed\" or \"finalized\"")
 	}
 	if cfg.ExpirationMinMins < 1 || cfg.ExpirationMaxMins < cfg.ExpirationMinMins {
 		errs = append(errs, "EXPIRATION_MINUTES_MIN/MAX: invalid bounds")
@@ -103,13 +88,11 @@ func Load() (*Config, error) {
 	if cfg.WorkerCount < 1 {
 		errs = append(errs, "WORKER_COUNT: must be >= 1")
 	}
-	if cfg.DepositAddressMode {
-		if _, err := solana.PublicKeyFromBase58(cfg.DepositProgramID); err != nil {
-			errs = append(errs, "DEPOSIT_PROGRAM_ID: invalid base58 pubkey (required in deposit mode)")
-		}
-		if cfg.GatewayHotWallet == "" {
-			errs = append(errs, "GATEWAY_HOT_WALLET: keypair path required in deposit mode")
-		}
+	if _, err := solana.PublicKeyFromBase58(cfg.DepositProgramID); err != nil {
+		errs = append(errs, "DEPOSIT_PROGRAM_ID: invalid base58 pubkey (required)")
+	}
+	if cfg.GatewayHotWallet == "" {
+		errs = append(errs, "GATEWAY_HOT_WALLET: keypair path required")
 	}
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("invalid configuration:\n  - %s", strings.Join(errs, "\n  - "))

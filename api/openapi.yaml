@@ -3,9 +3,9 @@ info:
   title: Solana Pay Gateway
   version: 1.0.0
   description: |
-    Self-hosted, non-custodial Solana payment gateway. Funds move directly
-    from customer to the merchant wallet configured server-side; this API
-    holds zero private keys and exposes no fund-moving endpoints.
+    Self-hosted Solana payment gateway built around an on-chain vault
+    program. Every invoice gets a unique derived deposit vault; funds can
+    only leave a vault to the merchant's wallet, enforced on-chain.
 servers:
   - url: /
 security:
@@ -131,7 +131,7 @@ components:
           description: Decimal string, e.g. "1.50"; max 9 (SOL) / 6 (USDC) fractional digits.
         currency:
           type: string
-          enum: [SOL, USDC]
+          enum: [SOL]
         order_id:
           type: string
           description: Merchant's own id; globally unique; duplicates return 409.
@@ -155,10 +155,9 @@ components:
         qr_code:
           type: string
           description: base64-encoded PNG QR of solana_pay_url
-        reference: { type: string }
         deposit_address:
           type: string
-          description: Present only in deposit-address mode - pay this address directly from any wallet (no Solana Pay support needed).
+          description: Vault PDA - pay this address directly from any wallet or exchange.
         status: { type: string, enum: [pending] }
         expires_at: { type: string, format: date-time }
     PaymentStatus:
@@ -171,13 +170,11 @@ components:
         currency: { type: string, enum: [SOL, USDC] }
         status:
           type: string
-          enum: [pending, processing, confirmed, finalized, expired, failed]
-        reference: { type: string }
-        tx_signature: { type: string }
-        detected_tx: { type: string }
+          enum: [pending, processing, confirmed, finalized, expired]
+        deposit_address: { type: string }
+        tx_signature:
+          type: string
+          description: The customer's payment transaction (receipt), recorded at sweep time.
         confirmed_at: { type: string, format: date-time }
         finalized_at: { type: string, format: date-time }
         expires_at: { type: string, format: date-time }
-        failure_reason:
-          type: string
-          enum: ['', WRONG_RECIPIENT, WRONG_MINT, WRONG_AMOUNT, MISSING_REFERENCE]

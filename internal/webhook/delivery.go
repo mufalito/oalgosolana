@@ -80,15 +80,13 @@ type Payload struct {
 
 // BuildPayload assembles the event body for a payment row.
 func BuildPayload(eventType string, p *store.Payment) Payload {
-	cur := solanapay.Currency(p.Currency)
 	pl := Payload{
 		Type:        eventType,
 		PaymentID:   p.ID,
 		OrderID:     p.OrderID,
-		Amount:      solanapay.FormatAmount(p.AmountBase, cur),
+		Amount:      solanapay.FormatAmount(p.AmountBase),
 		AmountBase:  strconv.FormatUint(p.AmountBase, 10),
 		Currency:    p.Currency,
-		Reference:   p.Reference,
 		TxSignature: p.TxSignature,
 		ExpiresAt:   p.ExpiresAt.Format(time.RFC3339),
 	}

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -100,25 +99,10 @@ func (d *RPCDetector) call(ctx context.Context, result any, method string, param
 		}
 		return envelope.Error
 	}
-	if string(envelope.Result) == "null" {
-		return &NotFoundError{Method: method}
-	}
 	if err := json.Unmarshal(envelope.Result, result); err != nil {
 		return fmt.Errorf("%s: decode result: %w", method, err)
 	}
 	return nil
-}
-
-// NotFoundError means the RPC returned null for the requested object
-// (e.g. getTransaction before indexing) — callers should retry.
-type NotFoundError struct{ Method string }
-
-func (e *NotFoundError) Error() string { return e.Method + ": not found" }
-
-// IsNotFound reports whether err is a NotFoundError.
-func IsNotFound(err error) bool {
-	var nf *NotFoundError
-	return errors.As(err, &nf)
 }
 
 // SignaturesForAddress returns up to 10 recent successful signatures touching ref.
@@ -139,108 +123,6 @@ func (d *RPCDetector) SignaturesForAddress(ctx context.Context, ref string) ([]s
 		}
 	}
 	return out, nil
-}
-
-// accountKey accepts both plain base58 strings and objects
-// ({"pubkey": "...", ...}) that some RPC providers return for versioned
-// messages with address-lookup tables.
-type accountKey string
-
-func (k *accountKey) UnmarshalJSON(b []byte) error {
-	var s string
-	if err := json.Unmarshal(b, &s); err == nil {
-		*k = accountKey(s)
-		return nil
-	}
-	var obj struct {
-		Pubkey string `json:"pubkey"`
-	}
-	if err := json.Unmarshal(b, &obj); err != nil {
-		return err
-	}
-	*k = accountKey(obj.Pubkey)
-	return nil
-}
-
-func (k accountKey) String() string { return string(k) }
-
-type jsonParsedTx struct {
-	Transaction struct {
-		Message struct {
-			AccountKeys []accountKey `json:"accountKeys"`
-		} `json:"message"`
-	} `json:"transaction"`
-	Meta *struct {
-		PreBalances       []uint64       `json:"preBalances"`
-		PostBalances      []uint64       `json:"postBalances"`
-		PreTokenBalances  []tokenBalance `json:"preTokenBalances"`
-		PostTokenBalances []tokenBalance `json:"postTokenBalances"`
-		Err               any            `json:"err"`
-	} `json:"meta"`
-	Slot uint64 `json:"slot"`
-}
-
-type tokenBalance struct {
-	AccountIndex int    `json:"accountIndex"`
-	Mint         string `json:"mint"`
-	Owner        string `json:"owner"`
-	Amount       string `json:"amount"`
-}
-
-// Transaction fetches a jsonParsed transaction and computes per-recipient
-// deltas for the given wallet (merchant) as TxInfo.
-func (d *RPCDetector) Transaction(ctx context.Context, signature, recipient, commitment string) (*TxInfo, error) {
-	var tx jsonParsedTx
-	if err := d.call(ctx, &tx, "getTransaction", signature,
-		map[string]any{"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0, "commitment": commitment}); err != nil {
-		return nil, err
-	}
-	if tx.Meta == nil || tx.Transaction.Message.AccountKeys == nil {
-		return nil, &NotFoundError{Method: "getTransaction"}
-	}
-	if tx.Meta.Err != nil {
-		return nil, fmt.Errorf("transaction %s failed on-chain", signature)
-	}
-	keys := make([]string, len(tx.Transaction.Message.AccountKeys))
-	for i, k := range tx.Transaction.Message.AccountKeys {
-		keys[i] = k.String()
-	}
-	info := &TxInfo{Signature: signature, AccountKeys: keys, TokenDeltas: map[string]uint64{}}
-	// SOL: lamport delta of the recipient's account entry.
-	for i, k := range keys {
-		if k == recipient && i < len(tx.Meta.PostBalances) && i < len(tx.Meta.PreBalances) &&
-			tx.Meta.PostBalances[i] > tx.Meta.PreBalances[i] {
-			info.RecipientDeltaLamports = tx.Meta.PostBalances[i] - tx.Meta.PreBalances[i]
-		}
-	}
-	// Tokens: net positive balance delta per mint for token accounts owned by
-	// the recipient (account indexes are stable pre/post within one tx).
-	preAmt := map[int]uint64{}
-	for _, b := range tx.Meta.PreTokenBalances {
-		preAmt[b.AccountIndex] = parseAmountUint(b.Amount)
-	}
-	for _, b := range tx.Meta.PostTokenBalances {
-		if b.Owner != recipient {
-			continue
-		}
-		post := parseAmountUint(b.Amount)
-		pre := preAmt[b.AccountIndex]
-		if post >= pre {
-			info.TokenDeltas[b.Mint] += post - pre
-		}
-	}
-	return info, nil
-}
-
-func parseAmountUint(s string) uint64 {
-	var v uint64
-	for _, r := range s {
-		if r < '0' || r > '9' {
-			return 0
-		}
-		v = v*10 + uint64(r-'0')
-	}
-	return v
 }
 
 // GetLatestBlockhash returns a recent blockhash for building transactions.

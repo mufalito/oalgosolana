@@ -8,14 +8,12 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/mufalito/oalgosolana/internal/chain"
 	"github.com/mufalito/oalgosolana/internal/store"
 )
 
 // Reaper runs the expiry tick.
 type Reaper struct {
 	DB       *store.Store
-	Detector chain.Detector
 	USDCMint string
 	Log      *slog.Logger
 	Interval time.Duration
@@ -56,7 +54,7 @@ func (r *Reaper) tick(ctx context.Context) error {
 	if len(ids) > 0 && r.OnExpired != nil {
 		r.OnExpired(len(ids))
 	}
-	return r.scanLate(ctx)
+	return nil
 }
 
 // sweepLateDeposits lets the watcher sweep expired deposit payments that
@@ -80,38 +78,4 @@ func (r *Reaper) sweepLateDeposits(ctx context.Context) {
 			r.Log.Error("late-deposit sweep failed", "payment_id", p.ID, "err", err.Error())
 		}
 	}
-}
-
-// scanLate checks recently-expired payments once more for a valid late
-// transaction; any hit is recorded in detected_tx (status stays expired).
-func (r *Reaper) scanLate(ctx context.Context) error {
-	payments, err := r.DB.QueryPayments(ctx, `SELECT `+store.PaymentCols+`
-		FROM payments
-		WHERE status='expired' AND detected_tx='' AND tx_signature=''
-		  AND expires_at > now() - interval '30 minutes'
-		LIMIT 50`)
-	if err != nil {
-		return err
-	}
-	for _, p := range payments {
-		sigs, err := r.Detector.SignaturesForAddress(ctx, p.Reference)
-		if err != nil {
-			continue // transient; next tick retries
-		}
-		for _, sig := range sigs {
-			tx, err := r.Detector.Transaction(ctx, sig, p.MerchantWallet, "confirmed")
-			if err != nil {
-				continue
-			}
-			if reason := chain.Validate(tx, p, r.USDCMint); !reason.Failed() {
-				if err := r.DB.MarkDetectedTx(ctx, p.ID, sig); err != nil {
-					return err
-				}
-				r.Log.Warn("late tx detected on expired payment",
-					"payment_id", p.ID, "reference", p.Reference, "tx", sig)
-				break
-			}
-		}
-	}
-	return nil
 }
