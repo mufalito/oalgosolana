@@ -148,7 +148,7 @@ func main() {
 		DB: st, Log: log,
 		Interval:           10 * time.Second,
 		LateDepositSweeper: w.SweepLateDeposit,
-		OnExpired: func(n int) { metrics.PaymentsExpired.Add(float64(n)) },
+		OnExpired:          func(n int) { metrics.PaymentsExpired.Add(float64(n)) },
 	}
 
 	g, gctx := errgroup.WithContext(ctx)
