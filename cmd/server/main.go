@@ -146,7 +146,8 @@ func main() {
 
 	rep := &reaper.Reaper{
 		DB: st, Log: log,
-		Interval:  10 * time.Second,
+		Interval:           10 * time.Second,
+		LateDepositSweeper: w.SweepLateDeposit,
 		OnExpired: func(n int) { metrics.PaymentsExpired.Add(float64(n)) },
 	}
 
