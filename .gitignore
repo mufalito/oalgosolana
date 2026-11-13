@@ -12,3 +12,8 @@ target/
 *.db
 test-ledger/
 claude.md
+ui/
+ui/node_modules/
+ui/.svelte-kit/
+ui/build/
+ui/.env

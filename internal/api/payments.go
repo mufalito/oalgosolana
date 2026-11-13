@@ -15,6 +15,7 @@ import (
 func (s *Server) mountPayments(r chi.Router) {
 	h := &paymentsHandler{svc: s.Payments, replayer: s.Replayer}
 	r.Post("/api/v1/payments", h.create)
+	r.Get("/api/v1/payments", h.list)
 	r.Get("/api/v1/payments/{id}", h.get)
 	if s.Replayer != nil {
 		r.Post("/api/v1/payments/{id}/webhook/replay", h.replay)
@@ -30,6 +31,7 @@ type paymentsHandler struct {
 type PaymentsService interface {
 	Create(ctx context.Context, req payment.CreateRequest) (*payment.Created, error)
 	GetByID(ctx context.Context, id string) (*payment.Get, error)
+	ListRecent(ctx context.Context) ([]*payment.Get, error)
 }
 
 type createPaymentRequest struct {
@@ -68,6 +70,15 @@ func (h *paymentsHandler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, created)
+}
+
+func (h *paymentsHandler) list(w http.ResponseWriter, r *http.Request) {
+	list, err := h.svc.ListRecent(r.Context())
+	if err != nil {
+		apierr.WriteError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, list)
 }
 
 func (h *paymentsHandler) get(w http.ResponseWriter, r *http.Request) {

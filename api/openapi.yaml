@@ -30,6 +30,19 @@ paths:
         '401': { $ref: '#/components/responses/Error401' }
         '409': { $ref: '#/components/responses/Error409' }
         '429': { $ref: '#/components/responses/Error429' }
+  /api/v1/payments:
+    get:
+      operationId: listPayments
+      summary: List the 50 most recent payments
+      responses:
+        '200':
+          description: Payments, newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/PaymentStatus' }
+        '401': { $ref: '#/components/responses/Error401' }
   /api/v1/payments/{id}:
     get:
       operationId: getPayment

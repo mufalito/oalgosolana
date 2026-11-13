@@ -188,6 +188,37 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Created, erro
 	}, nil
 }
 
+// ListRecent returns the most recent payments (newest first).
+func (s *Service) ListRecent(ctx context.Context) ([]*Get, error) {
+	rows, err := s.Store.QueryPayments(ctx,
+		`SELECT `+store.PaymentCols+` FROM payments ORDER BY created_at DESC LIMIT 50`)
+	if err != nil {
+		return nil, apierr.Errorf(500, apierr.CodeInternal, "list payments")
+	}
+	out := make([]*Get, 0, len(rows))
+	for _, p := range rows {
+		g := &Get{
+			PaymentID:      p.ID,
+			OrderID:        p.OrderID,
+			Amount:         solanapay.FormatAmount(p.AmountBase, p.Decimals),
+			AmountBase:     uitoa(p.AmountBase),
+			Currency:       p.Currency,
+			Status:         p.Status,
+			DepositAddress: p.Reference,
+			TxSignature:    p.TxSignature,
+			ExpiresAt:      p.ExpiresAt.Format(time.RFC3339),
+		}
+		if p.ConfirmedAt != nil {
+			g.ConfirmedAt = p.ConfirmedAt.Format(time.RFC3339)
+		}
+		if p.FinalizedAt != nil {
+			g.FinalizedAt = p.FinalizedAt.Format(time.RFC3339)
+		}
+		out = append(out, g)
+	}
+	return out, nil
+}
+
 // GetByID fetches a payment; store.ErrNotFound maps to 404.
 func (s *Service) GetByID(ctx context.Context, id string) (*Get, error) {
 	uid, err := uuid.Parse(id)
