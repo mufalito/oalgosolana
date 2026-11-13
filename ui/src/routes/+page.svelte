@@ -16,6 +16,40 @@
 	let copied = $state('');
 	let pollTimer = $state<ReturnType<typeof setInterval> | null>(null);
 
+	// reusable payment link
+	let makeLink = $state(false);
+	let linkDays = $state(30);
+	let paymentLink = $state('');
+	let linkNote = $state('');
+
+	async function buildLink() {
+		linkNote = '';
+		try {
+			const res = await fetch('/ui-api/links/sign', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					amount,
+					currency: effectiveCurrency() || 'SOL',
+					label,
+					message,
+					exp: expiration,
+					until: linkDays > 0 ? Math.floor(Date.now() / 1000) + linkDays * 86400 : 0
+				})
+			});
+			const data = await res.json();
+			paymentLink = data.url;
+		} catch (e) {
+			linkNote = e instanceof Error ? e.message : String(e);
+		}
+	}
+
+	async function copyLink() {
+		await navigator.clipboard.writeText(paymentLink);
+		linkNote = 'copied!';
+		setTimeout(() => (linkNote = ''), 1200);
+	}
+
 	const effectiveCurrency = () => (currency === 'CUSTOM' ? customMint.trim() : currency);
 
 	async function create() {
@@ -116,10 +150,42 @@
 				<p class="rounded-md border border-red-800 bg-red-950/50 px-3 py-2 text-sm text-red-300">{error}</p>
 			{/if}
 
-			<button type="submit" disabled={busy} class="rounded-md bg-emerald-600 px-4 py-2 font-medium text-white hover:bg-emerald-500 disabled:opacity-50">
-				{busy ? 'Creating…' : 'Create invoice'}
-			</button>
+			<div class="flex items-center gap-4">
+				<button type="submit" disabled={busy} class="rounded-md bg-emerald-600 px-4 py-2 font-medium text-white hover:bg-emerald-500 disabled:opacity-50">
+					{busy ? 'Creating…' : 'Create invoice'}
+				</button>
+				<label class="flex items-center gap-2 text-sm text-zinc-400">
+					<input type="checkbox" bind:checked={makeLink} /> also create a reusable payment link
+				</label>
+			</div>
 		</form>
+
+		{#if makeLink}
+			<div class="mt-4 rounded-lg border border-zinc-800 bg-zinc-900/40 p-4">
+				<label class="flex items-center gap-2 text-sm">
+					link valid for
+					<select bind:value={linkDays} class="rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1">
+						<option value={1}>1 day</option>
+						<option value={7}>1 week</option>
+						<option value={30}>30 days</option>
+						<option value={90}>90 days</option>
+						<option value={0}>forever (not recommended)</option>
+					</select>
+				</label>
+				<button onclick={buildLink} class="mt-3 rounded-md bg-zinc-700 px-3 py-1.5 text-sm hover:bg-zinc-600">
+					generate link
+				</button>
+				{#if linkNote}<span class="ml-2 text-xs text-emerald-400">{linkNote}</span>{/if}
+				{#if paymentLink}
+					<div class="mt-3 flex items-center gap-2">
+						<input readonly value={paymentLink} class="w-full rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1.5 font-mono text-xs" />
+						<a href={paymentLink} target="_blank" class="rounded-md border border-zinc-700 px-2 py-1.5 text-xs hover:bg-zinc-800">open</a>
+						<button onclick={copyLink} class="rounded-md border border-zinc-700 px-2 py-1.5 text-xs hover:bg-zinc-800">copy</button>
+					</div>
+					<p class="mt-2 text-xs text-zinc-500">amount is locked by the signature — share anywhere, each open creates one invoice</p>
+				{/if}
+			</div>
+		{/if}
 	</section>
 
 	<section>
