@@ -5,8 +5,10 @@ package payment
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/url"
 	"time"
@@ -217,6 +219,124 @@ func (s *Service) ListRecent(ctx context.Context) ([]*Get, error) {
 		out = append(out, g)
 	}
 	return out, nil
+}
+
+// CreateLinkInput creates a reusable payment link.
+type CreateLinkInput struct {
+	Amount           string
+	Currency         string
+	Label            string
+	Message          string
+	ExpirationMinSet bool
+	ExpirationMin    int
+	LinkExpiresDays  int // 0 = never
+}
+
+// LinkCreated is the response for link creation.
+type LinkCreated struct {
+	ID       string `json:"id"`
+	Path     string `json:"path"` // /c/<id> — host it anywhere
+	Amount   string `json:"amount"`
+	Currency string `json:"currency"`
+	Label    string `json:"label,omitempty"`
+}
+
+// RandomLinkID returns a fresh opaque link id: pl_ + 20 base62 chars.
+func RandomLinkID() string {
+	n := make([]byte, 15)
+	if _, err := rand.Read(n); err != nil {
+		panic(err) // crypto/rand failure is unrecoverable
+	}
+	return "pl_" + base62(n)
+}
+
+const b62 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+func base62(b []byte) string {
+	var out []byte
+	for _, x := range b {
+		out = append(out, b62[int(x)%62])
+	}
+	return string(out)
+}
+
+// CreateLink validates and stores a payment link.
+func (s *Service) CreateLink(ctx context.Context, in CreateLinkInput) (*LinkCreated, error) {
+	currency := "SOL"
+	decimals := solanapay.SOLDecimals
+	mint := ""
+	if in.Currency != "" && in.Currency != "SOL" {
+		if _, err := solana.PublicKeyFromBase58(in.Currency); err != nil {
+			return nil, apierr.Errorf(400, apierr.CodeInvalidCurrency, "currency must be SOL or a base58 mint address")
+		}
+		if !s.Cfg.AcceptsMint(in.Currency) {
+			return nil, apierr.Errorf(400, apierr.CodeInvalidCurrency, "mint not accepted by this gateway")
+		}
+		d, err := s.MintDecimals(ctx, in.Currency)
+		if err != nil {
+			return nil, apierr.Errorf(400, apierr.CodeInvalidCurrency, "unknown or non-mint account")
+		}
+		mint = in.Currency
+		currency = in.Currency
+		decimals = int(d)
+	}
+	amountBase, err := solanapay.ParseAmount(in.Amount, decimals)
+	if err != nil {
+		return nil, apierr.Errorf(400, apierr.CodeInvalidAmount, "amount: %v", err)
+	}
+	if mint == "" && s.DepositRentMinimum != nil {
+		if min := s.DepositRentMinimum(ctx); amountBase < min {
+			return nil, apierr.Errorf(400, apierr.CodeInvalidAmount,
+				"amount must be at least %s SOL (rent-exempt minimum read from RPC)",
+				solanapay.FormatAmount(min, solanapay.SOLDecimals))
+		}
+	}
+	exp := s.Cfg.ExpirationDefaultMins
+	if in.ExpirationMinSet {
+		if in.ExpirationMin < s.Cfg.ExpirationMinMins || in.ExpirationMin > s.Cfg.ExpirationMaxMins {
+			return nil, apierr.Errorf(400, apierr.CodeInvalidExpiry,
+				"expiration_minutes must be between %d and %d", s.Cfg.ExpirationMinMins, s.Cfg.ExpirationMaxMins)
+		}
+		exp = in.ExpirationMin
+	}
+	var linkExpiry *time.Time
+	if in.LinkExpiresDays > 0 {
+		t := time.Now().UTC().AddDate(0, 0, in.LinkExpiresDays)
+		linkExpiry = &t
+	}
+	l := &store.PaymentLink{
+		ID: RandomLinkID(), AmountBase: amountBase, Decimals: decimals, Currency: currency,
+		Label: in.Label, Message: in.Message, ExpirationMinutes: exp,
+		LinkExpiresAt: linkExpiry, CreatedAt: time.Now().UTC(),
+	}
+	if err := s.Store.CreatePaymentLink(ctx, l); err != nil {
+		return nil, apierr.Errorf(500, apierr.CodeInternal, "persist link")
+	}
+	return &LinkCreated{
+		ID: l.ID, Path: "/c/" + l.ID,
+		Amount: solanapay.FormatAmount(amountBase, decimals), Currency: currency, Label: l.Label,
+	}, nil
+}
+
+// RedeemLink creates one invoice from a payment link (server-side params).
+func (s *Service) RedeemLink(ctx context.Context, id string) (*Created, error) {
+	l, err := s.Store.GetPaymentLink(ctx, id)
+	if err != nil {
+		if errors.Is(err, store.ErrLinkExpired) {
+			return nil, apierr.Errorf(410, apierr.CodeNotFound, "payment link expired")
+		}
+		return nil, apierr.Errorf(404, apierr.CodeNotFound, "unknown payment link")
+	}
+	return s.Create(ctx, CreateRequest{
+		Amount:   solanapay.FormatAmount(l.AmountBase, l.Decimals),
+		Currency: l.Currency,
+		OrderID: fmt.Sprintf("link-%s-%d-%06d", id, time.Now().UTC().UnixNano()/1e6,
+			time.Now().UTC().Nanosecond()%1e6),
+		Label:            l.Label,
+		Message:          l.Message,
+		ExpirationMinSet: true,
+		ExpirationMin:    l.ExpirationMinutes,
+	})
 }
 
 // GetByID fetches a payment; store.ErrNotFound maps to 404.
